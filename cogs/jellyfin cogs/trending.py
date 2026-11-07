@@ -39,12 +39,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from utils.config import (
+from .utils.config import (
     JELLYFIN_URL, DB_DIR,
     TRENDING_DB_PATH as DB_PATH, TIMEZONE as TZ,
 )
-from utils.jellyfin_api import JellyfinClient
-from utils.db import run_query, run_write, run_script
+from .utils.jellyfin_api import JellyfinClient
+from .utils.db import run_query, run_write, run_script
 
 logger = logging.getLogger("trending_cog")
 

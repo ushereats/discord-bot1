@@ -101,14 +101,14 @@ from datetime import datetime, timezone
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from utils.config import (
+from .utils.config import (
     OWNER_DISCORD_ID, TARGET_GUILD_ID, JELLYFIN_URL, JELLYFIN_API_KEY,
     LINKED_ROLE_ID, TOKEN_CHANNEL_ID, LOG_CHANNEL_ID, DB_DIR,
     LINKS_DB_PATH as DB_PATH,
     EMBED_DESCRIPTION_LIMIT, EMBED_FIELD_VALUE_LIMIT, EMBED_TOTAL_LIMIT,
 )
-from utils.jellyfin_api import JellyfinClient
-from utils.db import Database
+from .utils.jellyfin_api import JellyfinClient
+from .utils.db import Database
 
 logger = logging.getLogger("registry_commands_cog")
 

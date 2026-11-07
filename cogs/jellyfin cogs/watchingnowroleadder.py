@@ -41,14 +41,14 @@ import time
 import discord
 from discord.ext import commands, tasks
 
-from utils.config import (
+from .utils.config import (
     TARGET_GUILD_ID,
     WATCHING_ROLE_ID,
     BROWSING_ROLE_ID,
     LINKS_DB_PATH,
 )
-from utils.jellyfin_api import JellyfinClient
-from utils.db import run_query
+from .utils.jellyfin_api import JellyfinClient
+from .utils.db import run_query
 
 logger = logging.getLogger("watching_role_cog")
 

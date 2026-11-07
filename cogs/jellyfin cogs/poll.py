@@ -73,8 +73,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from utils.config import OWNER_DISCORD_ID, POLL_DB_PATH as DB_PATH
-from utils.db import run_query, run_write, run_script
+from .utils.config import OWNER_DISCORD_ID, POLL_DB_PATH as DB_PATH
+from .utils.db import run_query, run_write, run_script
 
 logger = logging.getLogger("poll_cog")
 

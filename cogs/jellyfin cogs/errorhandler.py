@@ -63,7 +63,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
-from utils.config import ERROR_CHANNEL_ID, WATCH_CHANNEL_ID, COMMANDS_CHANNEL_ID
+from .utils.config import ERROR_CHANNEL_ID, WATCH_CHANNEL_ID, COMMANDS_CHANNEL_ID
 
 logger = logging.getLogger("error_handler_cog")
 

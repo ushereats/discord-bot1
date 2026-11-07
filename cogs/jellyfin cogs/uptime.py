@@ -38,7 +38,7 @@ import logging
 import discord
 from discord.ext import commands, tasks
 
-from utils.config import JELLYFIN_URL, UPTIME_CHANNEL_ID as CHANNEL_ID
+from .utils.config import JELLYFIN_URL, UPTIME_CHANNEL_ID as CHANNEL_ID
 
 logger = logging.getLogger("jellyfin_uptime_cog")
 

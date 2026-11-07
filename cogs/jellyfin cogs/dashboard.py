@@ -67,8 +67,8 @@ import os
 import shutil
 import time
 
-from utils.config import JELLYFIN_URL, DASHBOARD_API_KEY, DASHBOARD_DB_PATH, DB_DIR
-from utils.jellyfin_api import JellyfinClient
+from .utils.config import JELLYFIN_URL, DASHBOARD_API_KEY, DASHBOARD_DB_PATH, DB_DIR
+from .utils.jellyfin_api import JellyfinClient
 
 logger = logging.getLogger("jellyfin_dashboard_cog")
 

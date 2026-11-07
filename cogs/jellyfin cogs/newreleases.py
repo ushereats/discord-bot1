@@ -202,12 +202,12 @@ import imageio_ffmpeg
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from utils.config import (
+from .utils.config import (
     JELLYFIN_URL, JELLYFIN_API_KEY, OWNER_DISCORD_ID,
     DB_DIR, NEW_MEDIA_DB_PATH,
 )
-from utils.jellyfin_api import JellyfinClient
-from utils.db import run_query, run_write, run_script
+from .utils.jellyfin_api import JellyfinClient
+from .utils.db import run_query, run_write, run_script
 
 logger = logging.getLogger("new_media_cog")
 

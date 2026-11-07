@@ -65,8 +65,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from utils.config import JELLYFIN_URL, JELLYFIN_API_KEY, LOG_CHANNEL_ID, LINKS_DB_PATH, REMOTE_DB_PATH
-from utils.db import Database, run_query, run_write, run_script
+from .utils.config import JELLYFIN_URL, JELLYFIN_API_KEY, LOG_CHANNEL_ID, LINKS_DB_PATH, REMOTE_DB_PATH
+from .utils.db import Database, run_query, run_write, run_script
 
 logger = logging.getLogger("remote_cog")
 

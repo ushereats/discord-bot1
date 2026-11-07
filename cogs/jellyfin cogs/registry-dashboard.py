@@ -37,11 +37,11 @@ from datetime import datetime
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from utils.config import (
+from .utils.config import (
     TARGET_GUILD_ID, OWNER_DISCORD_ID, LINKS_DB_PATH,
 )
-from utils.jellyfin_api import JellyfinClient
-from utils.db import run_query, run_write, run_script
+from .utils.jellyfin_api import JellyfinClient
+from .utils.db import run_query, run_write, run_script
 
 logger = logging.getLogger("registry_dashboard_cog")
 

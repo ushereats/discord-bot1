@@ -32,9 +32,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from utils.config import OWNER_DISCORD_ID, PEAK_DB_PATH as DB_PATH, TIMEZONE
-from utils.jellyfin_api import JellyfinClient
-from utils.db import Database
+from .utils.config import OWNER_DISCORD_ID, PEAK_DB_PATH as DB_PATH, TIMEZONE
+from .utils.jellyfin_api import JellyfinClient
+from .utils.db import Database
 
 logger = logging.getLogger("peak_streams_cog")
 DAYS = 7

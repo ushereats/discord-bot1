@@ -46,12 +46,12 @@ from datetime import datetime, timezone, timedelta
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from utils.config import (
+from .utils.config import (
     JELLYFIN_URL, DB_DIR,
     DAILY_DB_PATH, LINKS_DB_PATH,
 )
-from utils.jellyfin_api import JellyfinClient
-from utils.db import run_query, run_write, run_script
+from .utils.jellyfin_api import JellyfinClient
+from .utils.db import run_query, run_write, run_script
 
 logger = logging.getLogger("daily_stats_cog")
 

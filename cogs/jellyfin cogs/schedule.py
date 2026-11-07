@@ -33,7 +33,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from utils.config import OWNER_DISCORD_ID, TIMEZONE, SCHEDULE_DB_PATH as DB_PATH
+from .utils.config import OWNER_DISCORD_ID, TIMEZONE, SCHEDULE_DB_PATH as DB_PATH
 
 logger = logging.getLogger("schedule_cog")
 CHECK_SECONDS = 30
