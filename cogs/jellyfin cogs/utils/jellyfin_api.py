@@ -226,3 +226,8 @@ class JellyfinClient:
     @staticmethod
     def user_avatar_url(user_id: str) -> str:
         return f"{JELLYFIN_URL}/Users/{user_id}/Images/Primary"
+
+
+# No-op setup so the extension loader skips this without error.
+async def setup(bot):  # noqa: ARG001
+    pass

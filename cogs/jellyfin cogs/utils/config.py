@@ -53,3 +53,8 @@ EMBED_TOTAL_SAFETY_MARGIN = 64
 MIN_FIELD_BUDGET = 150
 MESSAGE_CONTENT_LIMIT = 2000
 DM_BLOCKED_ERROR_CODE = 50007
+
+
+# No-op setup so the extension loader skips this without error.
+async def setup(bot):  # noqa: ARG001
+    pass

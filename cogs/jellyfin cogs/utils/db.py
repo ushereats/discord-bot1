@@ -135,3 +135,8 @@ async def run_script(db_path: str, sql: str):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     async with aiosqlite.connect(db_path) as conn:
         await conn.executescript(sql)
+
+
+# No-op setup so the extension loader skips this without error.
+async def setup(bot):  # noqa: ARG001
+    pass
