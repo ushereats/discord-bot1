@@ -74,6 +74,20 @@ MAX_TRACEBACK_CHARS = 1000     # keep the code-block field under Discord's per-f
 # prevents any possibility of a report-about-a-report feedback loop).
 _EXCLUDED_LOGGER_NAMES = {"error_handler_cog"}
 
+# Logger names whose errors are suppressed while bot.jellyfin_down is True.
+# These cogs all talk to Jellyfin and will fail noisily during an outage —
+# the uptime cog already posts one clean DOWN/UP card, so repeating every
+# individual timeout here is pure spam.
+_JELLYFIN_LOGGER_NAMES = {
+    "jellyfin_dashboard_cog",
+    "remote_cog",
+    "watching_role_cog",
+    "peak_streams_cog",
+    "daily_stats_cog",
+    "trending_cog",
+    "newreleases_cog",
+}
+
 _bot_ref: commands.Bot | None = None
 _recent_keys: dict[str, float] = {}     # dedup key -> last-sent timestamp
 _suppressed_counts: dict[str, int] = {}  # dedup key -> count suppressed since last send
@@ -144,6 +158,10 @@ class ChannelLogHandler(logging.Handler):
             if record.name in _EXCLUDED_LOGGER_NAMES:
                 return
             if record.levelno < logging.WARNING:
+                return
+            # Suppress Jellyfin-related cog errors while the server is
+            # confirmed down — the uptime cog already handles notification.
+            if record.name in _JELLYFIN_LOGGER_NAMES and getattr(_bot_ref, "jellyfin_down", False):
                 return
 
             message = self.format(record)

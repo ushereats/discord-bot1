@@ -409,13 +409,15 @@ async def get_system_stats(jf: JellyfinClient, retry_on_counts_failure: bool = T
         _get_user_count(jf, force=force_users),
     )
 
-    if sys_err:
-        errors.append(f"/System/Info failed: {sys_err}")
+    if sys_err or sys_info is None:
+        if sys_err:
+            errors.append(f"/System/Info failed: {sys_err}")
         sys_info = {}
         latency_ms = "N/A"
 
-    if counts_err:
-        errors.append(f"/Items/Counts failed: {counts_err}")
+    if counts_err or counts is None:
+        if counts_err:
+            errors.append(f"/Items/Counts failed: {counts_err}")
         counts = {}
 
     if users_err:

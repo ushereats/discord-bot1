@@ -131,6 +131,9 @@ class JellyfinUptime(commands.Cog):
         # setup_hook. Set BEFORE the loop starts, so the first check never
         # runs without a session.
         self.session = self.bot.http_session
+        # Global flag other cogs / error handler check to suppress spam
+        state = _load_state()
+        self.bot.jellyfin_down = state.get("status") == "down"
         if not self.check_loop.is_running():
             self.check_loop.start()
 
@@ -249,6 +252,7 @@ class JellyfinUptime(commands.Cog):
         state["down_since"] = first_failed_at
         state["last_reason"] = reason
         state["status"] = "down"
+        self.bot.jellyfin_down = True
         self.check_loop.change_interval(seconds=DOWN_CHECK_INTERVAL_SECONDS)
 
         logger.warning(
@@ -268,6 +272,7 @@ class JellyfinUptime(commands.Cog):
         state["incident_last_transition_at"] = now
         state["down_since"] = None
         state["status"] = "up"
+        self.bot.jellyfin_down = False
         self.check_loop.change_interval(seconds=CHECK_INTERVAL_SECONDS)
 
         logger.info(
