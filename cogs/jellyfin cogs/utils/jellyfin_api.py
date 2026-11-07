@@ -11,13 +11,15 @@ Usage in a cog:
 
     class MyCog(commands.Cog):
         async def cog_load(self):
-            self.jf = JellyfinClient(self.bot)
+            # Use the shared instance (one user cache, one semaphore)
+            self.jf = getattr(self.bot, "jf", None) or JellyfinClient(self.bot)
 
         async def some_method(self):
             users = await self.jf.get_users()
             sessions = await self.jf.get_sessions(active_within=600)
 """
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -29,6 +31,7 @@ from .config import JELLYFIN_URL, JELLYFIN_API_KEY
 logger = logging.getLogger("jellyfin_api")
 
 DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=10)
+DEFAULT_CONCURRENCY = 5  # max parallel requests to Jellyfin
 
 
 def _build_headers(api_key: str | None = None) -> dict[str, str]:
@@ -42,14 +45,18 @@ def _build_headers(api_key: str | None = None) -> dict[str, str]:
 class JellyfinClient:
     """Thin async wrapper around Jellyfin's REST API.
 
-    One instance per cog. All requests go through the bot's shared
-    aiohttp.ClientSession — this class never creates or closes one.
+    Intended as a shared instance on the bot (bot.jf) so all cogs share
+    one user cache and one concurrency semaphore. All requests go through
+    the bot's shared aiohttp.ClientSession — this class never creates or
+    closes one.
     """
 
-    def __init__(self, bot, *, api_key: str | None = None, timeout: aiohttp.ClientTimeout | None = None):
+    def __init__(self, bot, *, api_key: str | None = None, timeout: aiohttp.ClientTimeout | None = None,
+                 concurrency: int = DEFAULT_CONCURRENCY):
         self._bot = bot
         self._headers = _build_headers(api_key)
         self._timeout = timeout or DEFAULT_TIMEOUT
+        self._sem = asyncio.Semaphore(concurrency)
         # Cached /Users list — shared across lookups and duplicate-name checks.
         self._users_cache: list[dict] | None = None
         self._users_cache_time: float = 0.0
@@ -68,18 +75,19 @@ class JellyfinClient:
                       headers: dict | None = None,
                       raise_for_status: bool = True) -> aiohttp.ClientResponse:
         """Fire a request and return the response. Caller must use `async with`
-        or close the response."""
+        or close the response. Semaphore-gated to limit parallel requests."""
         url = f"{JELLYFIN_URL}{path}"
-        resp = await self.session.request(
-            method, url,
-            headers=headers or self._headers,
-            params=params,
-            json=json,
-            timeout=timeout or self._timeout,
-        )
-        if raise_for_status:
-            resp.raise_for_status()
-        return resp
+        async with self._sem:
+            resp = await self.session.request(
+                method, url,
+                headers=headers or self._headers,
+                params=params,
+                json=json,
+                timeout=timeout or self._timeout,
+            )
+            if raise_for_status:
+                resp.raise_for_status()
+            return resp
 
     async def get_json(self, path: str, *, params: dict | None = None,
                        timeout: aiohttp.ClientTimeout | None = None) -> Any:

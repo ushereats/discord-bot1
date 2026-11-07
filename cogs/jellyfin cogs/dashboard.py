@@ -62,7 +62,6 @@ import aiohttp
 import asyncio
 import json
 import logging
-import aiosqlite
 import os
 import shutil
 import time
@@ -131,76 +130,68 @@ USER_COUNT_TTL_SECONDS = 600
 ACTIVE_WITHIN_SECONDS = 960
 
 
-# --- DATABASE LAYER (aiosqlite) ---
-# Dashboard uses a custom error-tuple pattern for its config DB.
-# These stay local; the shared utils.db is better suited to cogs
-# that don't need per-call error differentiation.
-async def _run_query(query, params=(), fetch=False, fetchall=False):
-    try:
-        async with aiosqlite.connect(DASHBOARD_DB_PATH) as conn:
-            cursor = await conn.execute(query, params)
-            if fetchall:
-                result = await cursor.fetchall()
-            elif fetch:
-                result = await cursor.fetchone()
-            else:
-                result = None
-            await cursor.close()
-            await conn.commit()
-            return result, None
-    except aiosqlite.Error as e:
-        logger.error(f"DB error on query [{query}]: {e}")
-        return None, str(e)
+# --- DATABASE LAYER (shared utils.db) ---
+# Thin wrappers around the shared ad-hoc helpers that preserve the
+# error-tuple interface the rest of this file relies on.
+
+from .utils.db import run_query as _db_query, run_write as _db_write, run_script as _db_script
 
 
 async def init_db():
-    await _run_query("PRAGMA journal_mode=WAL")
-    await _run_query('''
+    await _db_script(DASHBOARD_DB_PATH, """
+        PRAGMA journal_mode=WAL;
         CREATE TABLE IF NOT EXISTS dashboard_config (
             guild_id INTEGER PRIMARY KEY,
             dashboard_channel_id INTEGER,
             dashboard_message_id INTEGER
-        )
-    ''')
+        );
+    """)
 
 
 async def get_guild_config(guild_id: int):
-    row, err = await _run_query(
-        "SELECT guild_id, dashboard_channel_id, dashboard_message_id FROM dashboard_config WHERE guild_id=?",
-        (guild_id,), fetch=True
-    )
-    if err:
-        return None, err
-    if row is None:
+    try:
+        rows = await _db_query(
+            DASHBOARD_DB_PATH,
+            "SELECT guild_id, dashboard_channel_id, dashboard_message_id FROM dashboard_config WHERE guild_id=?",
+            (guild_id,),
+        )
+    except Exception as e:
+        logger.error(f"DB error fetching guild config: {e}")
+        return None, str(e)
+    if not rows:
         return {"guild_id": guild_id, "dashboard_channel_id": None, "dashboard_message_id": None}, None
-    return {"guild_id": row[0], "dashboard_channel_id": row[1], "dashboard_message_id": row[2]}, None
+    r = rows[0]
+    return {"guild_id": r["guild_id"], "dashboard_channel_id": r["dashboard_channel_id"], "dashboard_message_id": r["dashboard_message_id"]}, None
 
 
 async def upsert_guild_config(guild_id: int, **fields):
-    existing, err = await _run_query("SELECT guild_id FROM dashboard_config WHERE guild_id=?", (guild_id,), fetch=True)
-    if err:
-        return err
-    if existing is None:
-        columns = ["guild_id"] + list(fields.keys())
-        placeholders = ", ".join(["?"] * len(columns))
-        values = [guild_id] + list(fields.values())
-        _, err = await _run_query(f"INSERT INTO dashboard_config ({', '.join(columns)}) VALUES ({placeholders})", tuple(values))
-        return err
-    set_clause = ", ".join(f"{k}=?" for k in fields.keys())
-    values = list(fields.values()) + [guild_id]
-    _, err = await _run_query(f"UPDATE dashboard_config SET {set_clause} WHERE guild_id=?", tuple(values))
-    return err
+    try:
+        rows = await _db_query(DASHBOARD_DB_PATH, "SELECT guild_id FROM dashboard_config WHERE guild_id=?", (guild_id,))
+        if not rows:
+            columns = ["guild_id"] + list(fields.keys())
+            placeholders = ", ".join(["?"] * len(columns))
+            values = [guild_id] + list(fields.values())
+            await _db_write(DASHBOARD_DB_PATH, f"INSERT INTO dashboard_config ({', '.join(columns)}) VALUES ({placeholders})", tuple(values))
+        else:
+            set_clause = ", ".join(f"{k}=?" for k in fields.keys())
+            values = list(fields.values()) + [guild_id]
+            await _db_write(DASHBOARD_DB_PATH, f"UPDATE dashboard_config SET {set_clause} WHERE guild_id=?", tuple(values))
+        return None
+    except Exception as e:
+        logger.error(f"DB error upserting guild config: {e}")
+        return str(e)
 
 
 async def get_all_dashboard_configs():
-    rows, err = await _run_query(
-        "SELECT guild_id, dashboard_channel_id, dashboard_message_id FROM dashboard_config "
-        "WHERE dashboard_channel_id IS NOT NULL AND dashboard_message_id IS NOT NULL",
-        fetchall=True
-    )
-    if err or not rows:
+    try:
+        rows = await _db_query(
+            DASHBOARD_DB_PATH,
+            "SELECT guild_id, dashboard_channel_id, dashboard_message_id FROM dashboard_config "
+            "WHERE dashboard_channel_id IS NOT NULL AND dashboard_message_id IS NOT NULL",
+        )
+    except Exception:
         return []
-    return [{"guild_id": r[0], "dashboard_channel_id": r[1], "dashboard_message_id": r[2]} for r in rows]
+    return [{"guild_id": r["guild_id"], "dashboard_channel_id": r["dashboard_channel_id"], "dashboard_message_id": r["dashboard_message_id"]} for r in rows]
 
 
 # --- HELPER: search current guild for a message by ID (used for /dashboard's Set Message ID) ---

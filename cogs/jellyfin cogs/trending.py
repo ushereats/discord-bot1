@@ -137,7 +137,7 @@ def _range_label(period: str) -> str:
 class TrendingData:
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.jf = JellyfinClient(bot)
+        self.jf = getattr(bot, "jf", None) or JellyfinClient(bot)
         self._lists: dict[tuple, tuple[float, list[dict]]] = {}
         self._items: dict[str, tuple[float, dict | None]] = {}
         self._seasons: dict[str, tuple[float, float]] = {}

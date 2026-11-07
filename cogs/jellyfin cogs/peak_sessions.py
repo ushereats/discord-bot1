@@ -53,7 +53,7 @@ class PeakStreams(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.category = "Admin"
-        self.jf = JellyfinClient(bot)
+        self.jf = getattr(bot, "jf", None) or JellyfinClient(bot)
         self._db = Database(DB_PATH, row_factory=False)
         # Today's recorded peak, cached so the database is only written
         # when a NEW high is reached, not every minute.

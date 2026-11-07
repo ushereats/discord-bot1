@@ -56,11 +56,6 @@ Commands:
   expired early only when Discord PERMANENTLY refuses the DM (user gone,
   or error 50007); transient failures leave it pending for the next cycle.
 
-  Every command that mutates a link/account calls into the registry
-  dashboard cog (registry_dashboard.py) to force a refresh afterward, but
-  never touches dashboard rendering or the 5-minute poll itself — that
-  lives entirely in the dashboard cog.
-
   All database access goes through aiosqlite. This is not about
   concurrent writes — SQLite still only allows one writer at a time
   regardless of driver — it's about not blocking the bot's single event
@@ -77,8 +72,6 @@ Commands:
       all). Age filters and page slices run in SQL against indexes.
     - Action-log lines are batched into combined messages every
       ACTION_LOG_FLUSH_SECONDS (mentions render, never ping).
-    - Dashboard refresh requests within DASHBOARD_REFRESH_DEBOUNCE_SECONDS
-      collapse into one refresh.
     - Background loops catch their own exceptions, so one bad pass never
       stops a loop. The weekly sync's last-run time is persisted, so
       restarts neither trigger nor postpone it.
@@ -123,7 +116,6 @@ WEEKLY_SYNC_INTERVAL_HOURS = 168  # automatic Sync cadence, independent of anyon
 SYNC_DUE_CHECK_MINUTES = 60  # how often weekly_sync_loop checks whether a sync is due (last sync time is persisted, so restarts don't trigger one)
 TOKEN_EXPIRY_CHECK_MINUTES = 10  # how often the background loop sweeps for expired tokens
 
-DASHBOARD_REFRESH_DEBOUNCE_SECONDS = 3  # refresh requests arriving within this window collapse into one dashboard refresh
 ACTION_LOG_FLUSH_SECONDS = 2  # log lines are batched and posted at most once per this interval
 JELLYFIN_USERS_CACHE_SECONDS = 30  # /Users list reuse window for lookups and duplicate-name checks
 
@@ -276,9 +268,8 @@ async def _set_meta(key: str, value: str):
 
 
 async def _ensure_db():
-    """Creates all registry tables, same as registry_dashboard.py. Both
-    cogs call this independently on load — CREATE TABLE IF NOT EXISTS is
-    idempotent, so it's safe regardless of which cog loads first."""
+    """Creates all registry tables. CREATE TABLE IF NOT EXISTS is
+    idempotent, so it's safe regardless of load order."""
     conn = await _get_db()
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS links (
@@ -286,13 +277,6 @@ async def _ensure_db():
             jellyfin_user_id TEXT NOT NULL,
             linked_by INTEGER NOT NULL,
             linked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS registry_dashboard_config (
-            guild_id INTEGER PRIMARY KEY,
-            dashboard_channel_id INTEGER,
-            dashboard_message_id INTEGER
         )
     """)
     await conn.execute("""
@@ -362,6 +346,7 @@ async def _ensure_db():
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_left_users_jfid ON left_users(jellyfin_user_id)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_tokens_issued_at ON signup_tokens(issued_at)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_left_users_left_at ON left_users(left_at)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_tokens_message_id ON signup_tokens(message_id)")
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS registry_meta (
             key TEXT PRIMARY KEY,
@@ -1108,10 +1093,6 @@ async def _delete_left_user_account(bot, discord_id: int, jellyfin_user_id: str,
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
-    dashboard_cog = bot.get_cog("JellyfinRegistryDashboard")
-    if dashboard_cog is not None:
-        dashboard_cog._member_cache.pop(discord_id, None)
-
     action_word = "Deleted" if result == "deleted" else "Cleaned up (already gone)"
     await _log_action(
         bot,
@@ -1395,10 +1376,6 @@ async def _reconcile_pending_signups(bot) -> None:
                 f"next pass rather than assuming nothing was created."
             )
 
-    commands_cog = bot.get_cog("JellyfinRegistryCommands")
-    if recovered and commands_cog is not None:
-        await commands_cog._notify_dashboard(member_ids=recovered_ids)
-
     if recovered or discarded or cleared or flagged_this_pass:
         summary = (
             f"[JellyfinRegistryCommands] Pending-signup reconcile: recovered {recovered}, discarded {discarded} "
@@ -1622,10 +1599,6 @@ class SignupModal(discord.ui.Modal, title="Create your Jellyfin account"):
                 await commands_cog._assign_linked_role(self.discord_id)
         except Exception as e:
             logger.error(f"[JellyfinRegistryCommands] Post-signup role assignment failed for {self.discord_id}: {type(e).__name__}: {e}", exc_info=True)
-
-        commands_cog = interaction.client.get_cog("JellyfinRegistryCommands")
-        if commands_cog is not None:
-            await commands_cog._notify_dashboard(discord_id=self.discord_id)
 
         await _log_action(
             interaction.client,
@@ -2346,8 +2319,6 @@ class DeleteLeftUsersButton(discord.ui.Button):
             await asyncio.gather(*(_process(row) for row in to_delete))
 
         commands_cog = interaction.client.get_cog("JellyfinRegistryCommands")
-        if commands_cog is not None and affected_discord_ids:
-            await commands_cog._notify_dashboard()
 
         resumed = False
         if commands_cog is not None and commands_cog._auto_delete_paused:
@@ -2558,10 +2529,6 @@ class DeleteInactiveUsersButton(discord.ui.Button):
                         except (discord.Forbidden, discord.HTTPException):
                             pass
 
-                dashboard_cog = interaction.client.get_cog("JellyfinRegistryDashboard")
-                if dashboard_cog is not None:
-                    dashboard_cog._member_cache.pop(discord_id, None)
-
                 if result == "already_gone":
                     already_gone += 1
                 else:
@@ -2590,10 +2557,6 @@ class DeleteInactiveUsersButton(discord.ui.Button):
         # Clear the cached list so the panel shows "press Refresh"
         # instead of a stale list that no longer matches reality.
         cog._last_sync_inactive_linked = []
-
-        # One dashboard refresh at the end, not per-deletion.
-        if cog is not None and (deleted or already_gone):
-            await cog._notify_dashboard(full=True)
 
         content, embed = await self.callback_view.build_full_display()
         await interaction.edit_original_response(content=content, embed=embed, view=self.callback_view)
@@ -3084,14 +3047,6 @@ async def _unregister_by_jellyfin_id(interaction: discord.Interaction, target_id
                     await member.remove_roles(role, reason="Jellyfin account deleted via /manage")
                 except (discord.Forbidden, discord.HTTPException):
                     role_note = "\n⚠️ Couldn't remove the linked role."
-        dashboard_cog = interaction.client.get_cog("JellyfinRegistryDashboard")
-        if dashboard_cog is not None:
-            dashboard_cog._member_cache.pop(strip_discord_id, None)
-
-    commands_cog = interaction.client.get_cog("JellyfinRegistryCommands")
-    if commands_cog is not None:
-        await commands_cog._notify_dashboard()
-
     await _log_action(interaction.client, f"🗑️ **Unregister (via /manage)** — <@{interaction.user.id}> deleted **{target_name}** (`{target_id}`).")
 
     return (
@@ -3133,7 +3088,6 @@ class LinkModal(discord.ui.Modal, title="Link Jellyfin account"):
         commands_cog = interaction.client.get_cog("JellyfinRegistryCommands")
         if commands_cog is not None:
             await commands_cog._assign_linked_role(self.target_user.id)
-            await commands_cog._notify_dashboard(discord_id=self.target_user.id)
 
         await interaction.followup.send(
             f"✅ Linked **{self.target_user.mention}** ({self.target_user.id}) → Jellyfin user **{match['Name']}** "
@@ -3169,9 +3123,6 @@ class UnlinkUserSelect(discord.ui.UserSelect):
         await interaction.edit_original_response(content=content, embed=embed, view=self.callback_view)
 
         if removed:
-            commands_cog = interaction.client.get_cog("JellyfinRegistryCommands")
-            if commands_cog is not None:
-                await commands_cog._notify_dashboard()
             await interaction.followup.send(f"✅ Unlinked **{target.mention}** ({target.id})", ephemeral=True)
             await _log_action(interaction.client, f"🔓 **Unlink (via /manage)** — <@{interaction.user.id}> unlinked <@{target.id}>.")
         else:
@@ -3234,7 +3185,6 @@ class RegisterModal(discord.ui.Modal, title="Register new Jellyfin account"):
             await _commit_signup_link(self.target_user.id, jellyfin_user_id, interaction.user.id)
             if commands_cog is not None:
                 await commands_cog._assign_linked_role(self.target_user.id)
-                await commands_cog._notify_dashboard(discord_id=self.target_user.id)
             return await interaction.followup.send(
                 f"⚠️ Account **{username}** created but granting full library access failed: `{type(e).__name__}: {e}`\n"
                 "It still got linked — fix access manually in Jellyfin.",
@@ -3245,7 +3195,6 @@ class RegisterModal(discord.ui.Modal, title="Register new Jellyfin account"):
         role_assigned = False
         if commands_cog is not None:
             role_assigned = await commands_cog._assign_linked_role(self.target_user.id)
-            await commands_cog._notify_dashboard(discord_id=self.target_user.id)
 
         note = "" if role_assigned else "\n⚠️ Couldn't assign the linked role (member not in server or missing permissions)."
         await interaction.followup.send(
@@ -3373,11 +3322,6 @@ class JellyfinRegistryCommands(commands.Cog):
         self._auto_delete_paused = False
         self._auto_delete_recent: deque[float] = deque()
         self._auto_delete_lock = asyncio.Lock()
-        # Debounced dashboard refresh state — see _notify_dashboard.
-        self._dash_requested = False
-        self._dash_member_ids: set[int] = set()
-        self._dash_full = False
-        self._dash_task: asyncio.Task | None = None
         # Strong references to fire-and-forget tasks. asyncio only keeps
         # weak references, so an unreferenced task can be garbage-collected
         # mid-run.
@@ -3394,7 +3338,11 @@ class JellyfinRegistryCommands(commands.Cog):
 
     async def cog_load(self):
         global _jf
-        _jf = JellyfinClient(self.bot)
+        # Shared JellyfinClient on the bot — all cogs reuse one instance
+        # (one user cache, one concurrency semaphore).
+        if not hasattr(self.bot, "jf"):
+            self.bot.jf = JellyfinClient(self.bot)
+        _jf = self.bot.jf
         if _db is None:
             await _open_db()
         await _ensure_db()
@@ -3445,8 +3393,6 @@ class JellyfinRegistryCommands(commands.Cog):
             loop.cancel()
         pending = [loop.get_task() for loop in self._loops()]
         pending += list(self._background_tasks)
-        if self._dash_task is not None:
-            pending.append(self._dash_task)
         pending = [t for t in pending if t is not None and not t.done()]
         for t in pending:
             t.cancel()
@@ -3587,8 +3533,6 @@ class JellyfinRegistryCommands(commands.Cog):
                 "retry with **Delete all left users now**.",
             )
             return
-
-        await self._notify_dashboard()
 
     # --- Background loops ---
     # Every loop body is wrapped in try/except inside the loop itself.
@@ -3899,45 +3843,6 @@ class JellyfinRegistryCommands(commands.Cog):
         except (discord.Forbidden, discord.HTTPException):
             return False
 
-    async def _notify_dashboard(self, discord_id: int | None = None, full: bool = False, member_ids=None):
-        """Requests a dashboard refresh. Requests arriving within
-        DASHBOARD_REFRESH_DEBOUNCE_SECONDS collapse into ONE refresh —
-        a burst of leaves, signups or a Delete-all batch costs one redraw,
-        not one per event. Targeted member IDs from every merged request
-        are combined; full=True from any of them escalates to a complete
-        re-resolution. Returns immediately; never raises."""
-        if discord_id is not None:
-            self._dash_member_ids.add(discord_id)
-        if member_ids:
-            self._dash_member_ids.update(member_ids)
-        if full:
-            self._dash_full = True
-        self._dash_requested = True
-        if self._dash_task is None or self._dash_task.done():
-            self._dash_task = asyncio.create_task(self._run_dashboard_refresh())
-
-    async def _run_dashboard_refresh(self):
-        # Loops while requests keep arriving, including ones made while a
-        # refresh was in progress.
-        while self._dash_requested:
-            await asyncio.sleep(DASHBOARD_REFRESH_DEBOUNCE_SECONDS)
-            self._dash_requested = False
-            member_ids, self._dash_member_ids = self._dash_member_ids, set()
-            full, self._dash_full = self._dash_full, False
-
-            cog = self.bot.get_cog("JellyfinRegistryDashboard")
-            if cog is None:
-                continue
-            try:
-                if full:
-                    await cog.refresh_dashboard(force=True, resolve_members=True)
-                elif member_ids:
-                    await cog.refresh_dashboard(force=True, resolve_member_ids=list(member_ids))
-                else:
-                    await cog.refresh_dashboard(force=True)
-            except Exception as e:
-                logger.error(f"[JellyfinRegistryCommands] Dashboard refresh failed: {type(e).__name__}: {e}", exc_info=True)
-
     @app_commands.command(name="jellyfin", description="View your Jellyfin account details, and reset your password or change your username")
     async def jellyfin_command(self, interaction: discord.Interaction):
         """DMs the caller a full account summary with Reset Password and
@@ -4022,9 +3927,6 @@ class JellyfinRegistryCommands(commands.Cog):
                 return await confirm_interaction.followup.send(f"❌ Couldn't delete the account: `{type(e).__name__}: {e}`", ephemeral=True)
 
             await _purge_account_rows(link["jellyfin_user_id"], interaction.user.id)  # link + any queue row, one commit
-            dashboard_cog = self.bot.get_cog("JellyfinRegistryDashboard")
-            if dashboard_cog is not None:
-                dashboard_cog._member_cache.pop(interaction.user.id, None)
 
             guild = self.bot.get_guild(TARGET_GUILD_ID)
             if guild is not None:
@@ -4036,7 +3938,6 @@ class JellyfinRegistryCommands(commands.Cog):
                     except (discord.Forbidden, discord.HTTPException):
                         pass
 
-            await self._notify_dashboard()
             await confirm_interaction.followup.send("✅ Your Jellyfin account has been deleted and unlinked.", ephemeral=True)
             logger.info(f"[JellyfinRegistryCommands] Self-serve deletion — <@{interaction.user.id}> deleted their own account via /leaveserver.")
             await _log_action(self.bot, f"🚪 **/leaveserver** — <@{interaction.user.id}> voluntarily deleted their own Jellyfin account (`{link['jellyfin_user_id']}`).")

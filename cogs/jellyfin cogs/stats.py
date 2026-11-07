@@ -461,7 +461,7 @@ class JellyfinStats(commands.Cog):
 
     async def cog_load(self):
         global _jf
-        _jf = JellyfinClient(self.bot)
+        _jf = getattr(self.bot, "jf", None) or JellyfinClient(self.bot)
         await _ensure_db()
 
     async def cog_unload(self):

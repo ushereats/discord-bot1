@@ -74,7 +74,7 @@ EVENT_COALESCE_SECONDS = 1.0
 class JellyfinWatchingRole(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.jf = JellyfinClient(self.bot)
+        self.jf = getattr(bot, "jf", None) or JellyfinClient(self.bot)
         # --- single shared state, updated by BOTH live events and the poll ---
         self._watch_sessions: dict[str, str] = {}   # sessionId -> jellyfin userId, sessions currently playing
         self._active_users: set[str] = set()        # jellyfin userIds active within the window

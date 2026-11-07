@@ -377,6 +377,10 @@ SCREENSHOT_SWEEP_INTERVAL_MINUTES = 30
 # SYNC_PACE_SECONDS: a batch of many missing screenshots processed
 # back-to-back would hit Discord/Jellyfin harder than spacing them out.
 SCREENSHOT_SWEEP_PACE_SECONDS = 2.0
+# How many screenshots can run concurrently during a sweep.  Each one
+# downloads a short transcode and spawns an ffmpeg subprocess, so this
+# caps both network and CPU load.
+SCREENSHOT_SWEEP_CONCURRENCY = 3
 
 # Circuit breaker — if this many consecutive screenshot attempts fail
 # (across the automatic on-post path AND the sweep), that's a signal
@@ -483,6 +487,13 @@ async def _ensure_db():
             await run_write(DB_PATH, ddl)
         except sqlite3.OperationalError:
             pass
+
+    # Indexes for frequent queries
+    for idx_ddl in (
+        "CREATE INDEX IF NOT EXISTS idx_ann_series ON announcements(group_type, series_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ann_screenshot ON announcements(quality_image_url, locked)",
+    ):
+        await run_write(DB_PATH, idx_ddl)
 
 
 async def _record_announcement(message_id: int, channel_id: int, group_type: str, item_ids: list[str],
@@ -1197,7 +1208,7 @@ class NewMediaAnnouncer(commands.Cog):
 
     async def cog_load(self):
         self.session = self.bot.http_session
-        self.jf = JellyfinClient(self.bot)
+        self.jf = getattr(self.bot, "jf", None) or JellyfinClient(self.bot)
         await _ensure_db()
         # Registers the fixed custom_id so the button on any already-sent
         # message keeps working after a restart — same pattern as the
@@ -1554,28 +1565,49 @@ class NewMediaAnnouncer(commands.Cog):
 
         succeeded = 0
         failed = 0
-        for record in records:
-            if not bypass_circuit_breaker and self._circuit_breaker_is_open():
-                logger.info(f"[NewMedia] Screenshot sweep stopping early — circuit breaker tripped mid-sweep ({succeeded} succeeded, {failed} failed so far).")
-                break
+        sem = asyncio.Semaphore(SCREENSHOT_SWEEP_CONCURRENCY)
+        stop_event = asyncio.Event()
 
-            channel = self.bot.get_channel(record["channel_id"])
-            if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
-                continue
+        async def _worker(record: dict) -> bool | None:
+            """Process one record under the semaphore. Returns True/False
+            for success/failure, or None if skipped."""
+            if stop_event.is_set():
+                return None
+            async with sem:
+                if stop_event.is_set():
+                    return None
+                if not bypass_circuit_breaker and self._circuit_breaker_is_open():
+                    stop_event.set()
+                    return None
 
-            group = await self._rebuild_group_from_record(record)
-            if group is None:
-                continue  # underlying Jellyfin item(s) gone — nothing to screenshot, not a failure worth counting
+                channel = self.bot.get_channel(record["channel_id"])
+                if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+                    return None
 
-            item_id = group.get("_screenshot_item_id")
-            runtime_ticks = group.get("_screenshot_runtime_ticks")
-            success = await self._apply_auto_screenshot(channel, record["message_id"], group, record["posted_at"], item_id, runtime_ticks)
-            if success:
-                succeeded += 1
-            else:
+                group = await self._rebuild_group_from_record(record)
+                if group is None:
+                    return None
+
+                item_id = group.get("_screenshot_item_id")
+                runtime_ticks = group.get("_screenshot_runtime_ticks")
+                success = await self._apply_auto_screenshot(channel, record["message_id"], group, record["posted_at"], item_id, runtime_ticks)
+                # Pace between releases of the semaphore slot
+                await asyncio.sleep(SCREENSHOT_SWEEP_PACE_SECONDS)
+                return success
+
+        results = await asyncio.gather(*(_worker(r) for r in records), return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"[NewMedia] Screenshot worker raised: {result!r}")
                 failed += 1
+            elif result is True:
+                succeeded += 1
+            elif result is False:
+                failed += 1
+            # None = skipped, don't count
 
-            await asyncio.sleep(SCREENSHOT_SWEEP_PACE_SECONDS)
+        if stop_event.is_set():
+            logger.info(f"[NewMedia] Screenshot sweep stopped early — circuit breaker tripped mid-sweep ({succeeded} succeeded, {failed} failed).")
 
         return succeeded, failed, len(records)
 
