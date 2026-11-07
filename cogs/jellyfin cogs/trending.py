@@ -34,24 +34,20 @@ import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
-import aiohttp
-import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from utils.config import (
+    JELLYFIN_URL, DB_DIR,
+    TRENDING_DB_PATH as DB_PATH, TIMEZONE as TZ,
+)
+from utils.jellyfin_api import JellyfinClient
+from utils.db import run_query, run_write, run_script
+
 logger = logging.getLogger("trending_cog")
 
-JELLYFIN_URL = "https://jellyfin.ushereats.com"
-JELLYFIN_API_KEY = "9cb945d0d38d45cb84fcc8a2e1541bd8"
-QUERY_URL = f"{JELLYFIN_URL}/user_usage_stats/submit_custom_query"
-
-DB_DIR = "/home/container/ushereats/DATABASES"
-DB_PATH = os.path.join(DB_DIR, "trending.db")
-
-TZ = ZoneInfo("Australia/Sydney")
 TOP_N = 10
 SHORTLIST = 25                      # entries ranked by hours before views are worked out
 LOOKBACK_WEEKS = 8                  # how far back "weeks in Top 10" looks
@@ -141,54 +137,25 @@ def _range_label(period: str) -> str:
 class TrendingData:
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.jf = JellyfinClient(bot)
         self._lists: dict[tuple, tuple[float, list[dict]]] = {}
         self._items: dict[str, tuple[float, dict | None]] = {}
         self._seasons: dict[str, tuple[float, float]] = {}
 
-    @property
-    def _headers(self):
-        return {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"', "accept": "application/json"}
-
     async def init_db(self):
         os.makedirs(DB_DIR, exist_ok=True)
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "CREATE TABLE IF NOT EXISTS weekly (kind TEXT, week TEXT, rank INTEGER, key TEXT, "
-                "PRIMARY KEY (kind, week, rank))"
-            )
-            await db.execute("CREATE TABLE IF NOT EXISTS weeks_done (kind TEXT, week TEXT, PRIMARY KEY (kind, week))")
-            await db.commit()
+        await run_script(DB_PATH,
+            "CREATE TABLE IF NOT EXISTS weekly (kind TEXT, week TEXT, rank INTEGER, key TEXT, "
+            "PRIMARY KEY (kind, week, rank));"
+            "CREATE TABLE IF NOT EXISTS weeks_done (kind TEXT, week TEXT, PRIMARY KEY (kind, week));")
 
     # -- raw sources --
 
     async def _sql(self, sql: str) -> list[dict] | None:
-        try:
-            async with self.bot.http_session.post(
-                QUERY_URL, headers=self._headers, json={"CustomQueryString": sql},
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                if resp.status != 200:
-                    logger.error(f"[Trending] Playback Reporting query failed: HTTP {resp.status}")
-                    return None
-                data = await resp.json(content_type=None)
-        except Exception as e:
-            logger.error(f"[Trending] Playback Reporting query failed: {type(e).__name__}: {e}")
-            return None
-        columns = data.get("colums") or data.get("columns") or []  # the plugin spells it "colums"
-        return [dict(zip(columns, row)) for row in data.get("results") or []]
+        return await self.jf.playback_query(sql)
 
     async def _get_json(self, path: str, params: dict):
-        try:
-            async with self.bot.http_session.get(
-                f"{JELLYFIN_URL}{path}", headers=self._headers, params=params,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                return await resp.json(content_type=None)
-        except Exception as e:
-            logger.warning(f"[Trending] Jellyfin {path} failed: {type(e).__name__}: {e}")
-            return None
+        return await self.jf.get_json(path, params=params)
 
     async def items(self, ids: list[str]) -> dict[str, dict]:
         """Jellyfin item info by (normalised) id, cached. Missing = deleted."""
@@ -316,22 +283,18 @@ class TrendingData:
     async def week_keys(self, kind: str, offset: int) -> list[str] | None:
         """Top 10 keys (in order) for a FINISHED week (offset <= -1)."""
         week = _week_start(offset).date().isoformat()
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT 1 FROM weeks_done WHERE kind=? AND week=?", (kind, week)) as cur:
-                done = await cur.fetchone()
-            if done:
-                async with db.execute("SELECT key FROM weekly WHERE kind=? AND week=? ORDER BY rank", (kind, week)) as cur:
-                    return [row[0] for row in await cur.fetchall()]
+        done = await run_query(DB_PATH, "SELECT 1 FROM weeks_done WHERE kind=? AND week=?", (kind, week))
+        if done:
+            rows = await run_query(DB_PATH, "SELECT key FROM weekly WHERE kind=? AND week=? ORDER BY rank", (kind, week))
+            return [r["key"] for r in rows]
         ranked = await self.compute(kind, _week_start(offset), _week_start(offset + 1), with_people=False)
         if ranked is None:
             return None
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.executemany(
+        for n, e in enumerate(ranked, start=1):
+            await run_write(DB_PATH,
                 "INSERT OR REPLACE INTO weekly (kind, week, rank, key) VALUES (?, ?, ?, ?)",
-                [(kind, week, n, e["key"]) for n, e in enumerate(ranked, start=1)],
-            )
-            await db.execute("INSERT OR REPLACE INTO weeks_done (kind, week) VALUES (?, ?)", (kind, week))
-            await db.commit()
+                (kind, week, n, e["key"]))
+        await run_write(DB_PATH, "INSERT OR REPLACE INTO weeks_done (kind, week) VALUES (?, ?)", (kind, week))
         return [e["key"] for e in ranked]
 
     async def top(self, kind: str, period: str) -> list[dict] | None:

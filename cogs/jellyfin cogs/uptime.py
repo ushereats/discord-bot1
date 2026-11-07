@@ -38,10 +38,11 @@ import logging
 import discord
 from discord.ext import commands, tasks
 
+from utils.config import JELLYFIN_URL, UPTIME_CHANNEL_ID as CHANNEL_ID
+
 logger = logging.getLogger("jellyfin_uptime_cog")
 
-CHANNEL_ID = 1539125023254511726
-CHECK_URL = "https://jellyfin.ushereats.com"
+CHECK_URL = JELLYFIN_URL
 # /health checks HTTP AND database connectivity — catches "up but broken"
 # (locked/corrupt DB, etc.) that a plain root-URL check would miss.
 HEALTH_URL = f"{CHECK_URL}/health"

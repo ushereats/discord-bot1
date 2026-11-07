@@ -22,23 +22,20 @@ post goes out (the bot needs "Mention Everyone" in that channel for
 @everyone to work).
 """
 
-import os
 import json
+import os
 import time
 import logging
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-logger = logging.getLogger("schedule_cog")
+from utils.config import OWNER_DISCORD_ID, TIMEZONE, SCHEDULE_DB_PATH as DB_PATH
 
-OWNER_DISCORD_ID = 723417665087078451
-TIMEZONE = ZoneInfo("Australia/Sydney")
-DB_PATH = os.path.join("/home/container/ushereats/DATABASES", "scheduled_posts.db")
+logger = logging.getLogger("schedule_cog")
 CHECK_SECONDS = 30
 MAX_PREVIEWS = 5
 IS_COMPONENTS_V2 = 1 << 15

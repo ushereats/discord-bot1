@@ -53,8 +53,6 @@ Jellyfin Dashboard Cog (Tracearr SSE transport, original architecture)
     https://raw.githubusercontent.com/Tracearr/Media-Server-SSE/main/manifest.json
     -> Catalog -> install "Tracearr SSE" -> restart Jellyfin.
     Requires Jellyfin 10.11+. See https://docs.tracearr.com/sse-plugin
-
-Config: set JELLYFIN_URL and JELLYFIN_API_KEY below.
 """
 
 import discord
@@ -69,12 +67,12 @@ import os
 import shutil
 import time
 
+from utils.config import JELLYFIN_URL, DASHBOARD_API_KEY, DASHBOARD_DB_PATH, DB_DIR
+from utils.jellyfin_api import JellyfinClient
+
 logger = logging.getLogger("jellyfin_dashboard_cog")
 
-# --- CONFIG: put your actual Jellyfin URL and API key here ---
-JELLYFIN_URL = "https://jellyfin.ushereats.com"
-JELLYFIN_API_KEY = "a47ad7e52bd741b08e8b586fc6873fea"
-
+# --- Timing / tuning constants ---
 SSE_RECONNECT_DELAY = 5       # base seconds between reconnect attempts if the stream drops
 SSE_MAX_RECONNECT_DELAY = 60  # cap for exponential backoff during a real outage
 SSE_READ_TIMEOUT_SECONDS = 60 # plugin pings every 30s — 60s of silence means the connection is actually dead
@@ -117,18 +115,12 @@ MIN_EDIT_INTERVAL_SECONDS = 10
 # per-service icons if you have them; falls back to the bot's own avatar.
 HOMELAB_THUMBNAIL_URL = None  # Set a permanent (non-expiring) image URL here if you have one; otherwise falls back to the bot's avatar.
 
-# Absolute path, same folder every other cog uses — a relative path broke
-# silently whenever the bot was launched from a different working
-# directory (a fresh empty DB, dashboard config "lost").
-DB_DIR = "/home/container/ushereats/DATABASES"
-os.makedirs(DB_DIR, exist_ok=True)
-DB_NAME = os.path.join(DB_DIR, "jellyfin.db")
-
 # One-time migration: if the old relative-path DB exists and the absolute
 # one doesn't yet, carry it over so the existing config isn't lost.
+os.makedirs(DB_DIR, exist_ok=True)
 _LEGACY_DB = os.path.abspath(os.path.join("DATABASES", "jellyfin.db"))
-if _LEGACY_DB != os.path.abspath(DB_NAME) and os.path.exists(_LEGACY_DB) and not os.path.exists(DB_NAME):
-    shutil.copy2(_LEGACY_DB, DB_NAME)
+if _LEGACY_DB != os.path.abspath(DASHBOARD_DB_PATH) and os.path.exists(_LEGACY_DB) and not os.path.exists(DASHBOARD_DB_PATH):
+    shutil.copy2(_LEGACY_DB, DASHBOARD_DB_PATH)
 
 # /Users returns every full user object (policies, config) — the single
 # heaviest call this cog makes, used only for a count. Cached for this long.
@@ -140,9 +132,12 @@ ACTIVE_WITHIN_SECONDS = 960
 
 
 # --- DATABASE LAYER (aiosqlite) ---
-async def run_query(query, params=(), fetch=False, fetchall=False):
+# Dashboard uses a custom error-tuple pattern for its config DB.
+# These stay local; the shared utils.db is better suited to cogs
+# that don't need per-call error differentiation.
+async def _run_query(query, params=(), fetch=False, fetchall=False):
     try:
-        async with aiosqlite.connect(DB_NAME) as conn:
+        async with aiosqlite.connect(DASHBOARD_DB_PATH) as conn:
             cursor = await conn.execute(query, params)
             if fetchall:
                 result = await cursor.fetchall()
@@ -159,8 +154,8 @@ async def run_query(query, params=(), fetch=False, fetchall=False):
 
 
 async def init_db():
-    await run_query("PRAGMA journal_mode=WAL")
-    await run_query('''
+    await _run_query("PRAGMA journal_mode=WAL")
+    await _run_query('''
         CREATE TABLE IF NOT EXISTS dashboard_config (
             guild_id INTEGER PRIMARY KEY,
             dashboard_channel_id INTEGER,
@@ -170,7 +165,7 @@ async def init_db():
 
 
 async def get_guild_config(guild_id: int):
-    row, err = await run_query(
+    row, err = await _run_query(
         "SELECT guild_id, dashboard_channel_id, dashboard_message_id FROM dashboard_config WHERE guild_id=?",
         (guild_id,), fetch=True
     )
@@ -182,23 +177,23 @@ async def get_guild_config(guild_id: int):
 
 
 async def upsert_guild_config(guild_id: int, **fields):
-    existing, err = await run_query("SELECT guild_id FROM dashboard_config WHERE guild_id=?", (guild_id,), fetch=True)
+    existing, err = await _run_query("SELECT guild_id FROM dashboard_config WHERE guild_id=?", (guild_id,), fetch=True)
     if err:
         return err
     if existing is None:
         columns = ["guild_id"] + list(fields.keys())
         placeholders = ", ".join(["?"] * len(columns))
         values = [guild_id] + list(fields.values())
-        _, err = await run_query(f"INSERT INTO dashboard_config ({', '.join(columns)}) VALUES ({placeholders})", tuple(values))
+        _, err = await _run_query(f"INSERT INTO dashboard_config ({', '.join(columns)}) VALUES ({placeholders})", tuple(values))
         return err
     set_clause = ", ".join(f"{k}=?" for k in fields.keys())
     values = list(fields.values()) + [guild_id]
-    _, err = await run_query(f"UPDATE dashboard_config SET {set_clause} WHERE guild_id=?", tuple(values))
+    _, err = await _run_query(f"UPDATE dashboard_config SET {set_clause} WHERE guild_id=?", tuple(values))
     return err
 
 
 async def get_all_dashboard_configs():
-    rows, err = await run_query(
+    rows, err = await _run_query(
         "SELECT guild_id, dashboard_channel_id, dashboard_message_id FROM dashboard_config "
         "WHERE dashboard_channel_id IS NOT NULL AND dashboard_message_id IS NOT NULL",
         fetchall=True
@@ -206,45 +201,6 @@ async def get_all_dashboard_configs():
     if err or not rows:
         return []
     return [{"guild_id": r[0], "dashboard_channel_id": r[1], "dashboard_message_id": r[2]} for r in rows]
-
-
-# --- SHARED HTTP SESSION (for REST calls — stats, hydration) ---
-# No longer owned by this module — shared across the whole bot process
-# via bot.http_session (created once in main.py's setup_hook). _bot_ref
-# is set once in cog_load.
-#
-# NOTE: the old session-level default header (X-Emby-Token baked in at
-# creation time) is gone now that this uses the shared, header-less
-# bot.http_session — jellyfin_get() below was updated to pass that
-# header explicitly per-request instead, same pattern the SSE loop
-# further down already used for its own Authorization header.
-_bot_ref = None
-
-
-def _get_session() -> aiohttp.ClientSession:
-    return _bot_ref.http_session
-
-
-async def jellyfin_get(path: str, params: dict = None):
-    if not JELLYFIN_URL or not JELLYFIN_API_KEY or JELLYFIN_API_KEY == "PUT_YOUR_API_KEY_HERE":
-        return None, "JELLYFIN_URL / JELLYFIN_API_KEY are not set at the top of dashboard.py — edit those two lines."
-
-    url = f"{JELLYFIN_URL}{path}"
-    headers = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"', "accept": "application/json"}
-    try:
-        session = _get_session()
-        async with session.get(url, headers=headers, params=params or {}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status == 401:
-                return None, "Jellyfin rejected the API key (401 Unauthorized) — check JELLYFIN_API_KEY is correct."
-            if resp.status != 200:
-                return None, f"Jellyfin returned status {resp.status} for `{path}`."
-            return await resp.json(), None
-    except aiohttp.ClientConnectorError as e:
-        return None, f"Couldn't connect to `{JELLYFIN_URL}` — is that address reachable from this bot's host? ({e})"
-    except asyncio.TimeoutError:
-        return None, f"Connection to `{JELLYFIN_URL}` timed out after 10s."
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
 
 
 # --- HELPER: search current guild for a message by ID (used for /dashboard's Set Message ID) ---
@@ -405,22 +361,23 @@ def _stats_comparable(stats: dict | None) -> dict | None:
 _user_count_cache = {"count": None, "ts": 0.0}
 
 
-async def _get_user_count(force: bool = False):
+async def _get_user_count(jf: JellyfinClient, force: bool = False):
     """Returns (count, err). /Users is only actually fetched every
     USER_COUNT_TTL_SECONDS (or when forced); otherwise the cached count is
     reused. A failed fetch keeps serving the last good count."""
     now = time.time()
     if not force and _user_count_cache["count"] is not None and now - _user_count_cache["ts"] < USER_COUNT_TTL_SECONDS:
         return _user_count_cache["count"], None
-    users, err = await jellyfin_get("/Users")
-    if err:
-        return _user_count_cache["count"], err
-    _user_count_cache["count"] = len(users)
-    _user_count_cache["ts"] = now
-    return _user_count_cache["count"], None
+    try:
+        users = await jf.get_users()
+        _user_count_cache["count"] = len(users)
+        _user_count_cache["ts"] = now
+        return _user_count_cache["count"], None
+    except Exception as e:
+        return _user_count_cache["count"], str(e)
 
 
-async def get_system_stats(retry_on_counts_failure: bool = True, force_users: bool = False):
+async def get_system_stats(jf: JellyfinClient, retry_on_counts_failure: bool = True, force_users: bool = False):
     """Returns (stats_dict, errors_list). Each of the three underlying calls
     is independent — a failure in one no longer blanks out data from the
     other two. Missing individual values fall back to 'N/A'. stats_dict is
@@ -430,29 +387,35 @@ async def get_system_stats(retry_on_counts_failure: bool = True, force_users: bo
     falling back to 'N/A' — this is the call most likely to matter right
     after a library-changed event, so a single transient failure shouldn't
     silently blank the numbers out."""
-    if not JELLYFIN_URL or not JELLYFIN_API_KEY or JELLYFIN_API_KEY == "PUT_YOUR_API_KEY_HERE":
-        return None, ["JELLYFIN_URL / JELLYFIN_API_KEY are not set at the top of dashboard.py — edit those two lines."]
-
     errors = []
 
     async def _fetch_sys_info_timed():
         start = time.perf_counter()
-        result, err = await jellyfin_get("/System/Info")
-        elapsed_ms = round((time.perf_counter() - start) * 1000)
-        return result, err, elapsed_ms
+        try:
+            result = await jf.get_json("/System/Info")
+            elapsed_ms = round((time.perf_counter() - start) * 1000)
+            return result, None, elapsed_ms
+        except Exception as e:
+            elapsed_ms = round((time.perf_counter() - start) * 1000)
+            return None, str(e), elapsed_ms
 
     async def _fetch_counts_with_retry():
-        result, err = await jellyfin_get("/Items/Counts")
-        if err and retry_on_counts_failure:
-            logger.warning(f"[Jellyfin] /Items/Counts failed once, retrying in 2s: {err}")
-            await asyncio.sleep(2)
-            result, err = await jellyfin_get("/Items/Counts")
-        return result, err
+        try:
+            return await jf.get_json("/Items/Counts"), None
+        except Exception as e:
+            if retry_on_counts_failure:
+                logger.warning(f"[Jellyfin] /Items/Counts failed once, retrying in 2s: {e}")
+                await asyncio.sleep(2)
+                try:
+                    return await jf.get_json("/Items/Counts"), None
+                except Exception as e2:
+                    return None, str(e2)
+            return None, str(e)
 
     (sys_info, sys_err, latency_ms), (counts, counts_err), (user_count, users_err) = await asyncio.gather(
         _fetch_sys_info_timed(),
         _fetch_counts_with_retry(),
-        _get_user_count(force=force_users),
+        _get_user_count(jf, force=force_users),
     )
 
     if sys_err:
@@ -487,7 +450,7 @@ def _fmt(value) -> str:
     return str(value)
 
 
-_NBSP = "\u00A0"  # Discord collapses runs of normal spaces; non-breaking spaces survive, so use these for column padding.
+_NBSP = " "  # Discord collapses runs of normal spaces; non-breaking spaces survive, so use these for column padding.
 
 WATCH_URL = "https://jellyfin.ushereats.com/"
 APP_URL = "https://github.com/Moonfin-Client"
@@ -907,6 +870,7 @@ class DashboardConfigView(discord.ui.View):
 class JellyfinDashboard(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.jf = JellyfinClient(bot, api_key=DASHBOARD_API_KEY)
         self.category = "Utility"
         self._sessions_by_id: dict[str, dict] = {}  # rebuilt from discrete SSE events into the same shape the native WS used to push wholesale
         self.ws_connected = False
@@ -935,7 +899,7 @@ class JellyfinDashboard(commands.Cog):
         on every broadcast. force_users also bypasses the 10-minute user
         count cache (manual Refresh Now only)."""
         if force or self._stats_cache is None:
-            stats, _ = await get_system_stats(force_users=force_users)
+            stats, _ = await get_system_stats(self.jf, force_users=force_users)
             self._stats_cache = stats
         return self._stats_cache
 
@@ -948,8 +912,6 @@ class JellyfinDashboard(commands.Cog):
         return self._dashboard_configs_cache
 
     async def cog_load(self):
-        global _bot_ref
-        _bot_ref = self.bot
         await init_db()
         self._ws_task = asyncio.create_task(self._sse_loop())
         if not self.tick_loop.is_running():
@@ -1011,7 +973,7 @@ class JellyfinDashboard(commands.Cog):
         only edits the message when a meaningful field changed (counts or
         version — latency deliberately excluded)."""
         try:
-            fresh_stats, _ = await get_system_stats()
+            fresh_stats, _ = await get_system_stats(self.jf)
             if fresh_stats is None:
                 return
             old_comparable = _stats_comparable(self._stats_cache)
@@ -1063,21 +1025,18 @@ class JellyfinDashboard(commands.Cog):
         line that ends it. The stream is read in raw chunks and split
         manually, so one unusually long line can't raise aiohttp's
         "line too long" error and drop the connection."""
-        if not JELLYFIN_URL or not JELLYFIN_API_KEY or JELLYFIN_API_KEY == "PUT_YOUR_API_KEY_HERE":
-            logger.error("[JellyfinDashboard] SSE not started — JELLYFIN_URL/JELLYFIN_API_KEY not configured.")
-            return
-
         await self.bot.wait_until_ready()
 
         url = f"{JELLYFIN_URL}/api/sse/events"
-        headers = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"', "Accept": "text/event-stream"}
+        # SSE uses raw streaming — manual headers with the dashboard API key.
+        headers = {"Authorization": f'MediaBrowser Token="{DASHBOARD_API_KEY}"', "Accept": "text/event-stream"}
 
         consecutive_failures = 0
 
         while True:
             connected_at = None
             try:
-                session = _get_session()
+                session = self.bot.http_session
                 timeout = aiohttp.ClientTimeout(total=None, sock_read=SSE_READ_TIMEOUT_SECONDS)
                 async with session.get(url, headers=headers, timeout=timeout) as resp:
                     if resp.status == 404:
@@ -1259,11 +1218,11 @@ class JellyfinDashboard(commands.Cog):
             logger.error(f"[JellyfinDashboard] Broadcast failed after sessions_push: {e}", exc_info=True)
 
     async def _fetch_all_sessions(self) -> list | None:
-        sessions, err = await jellyfin_get("/Sessions", params={"activeWithinSeconds": ACTIVE_WITHIN_SECONDS})
-        if err:
-            logger.error(f"[JellyfinDashboard] REST /Sessions fetch failed: {err}")
+        try:
+            return await self.jf.get_sessions(active_within=ACTIVE_WITHIN_SECONDS)
+        except Exception as e:
+            logger.error(f"[JellyfinDashboard] REST /Sessions fetch failed: {e}")
             return None
-        return sessions
 
     async def _get_sessions_snapshot_coalesced(self) -> list | None:
         """If a fetch is already in flight, every concurrent caller awaits

@@ -63,9 +63,9 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
-logger = logging.getLogger("error_handler_cog")
+from utils.config import ERROR_CHANNEL_ID, WATCH_CHANNEL_ID, COMMANDS_CHANNEL_ID
 
-ERROR_CHANNEL_ID = 1539140583744868463
+logger = logging.getLogger("error_handler_cog")
 
 DEDUP_WINDOW_SECONDS = 60      # same error key within this window gets folded, not resent
 MAX_TRACEBACK_CHARS = 1000     # keep the code-block field under Discord's per-field limit
@@ -282,11 +282,15 @@ async def _on_app_command_error(interaction: discord.Interaction, error: app_com
 
 # --- COG ---
 
+REPLY_COOLDOWN_SECONDS = 0  # min seconds between command-channel hints to the same user
+
+
 class ErrorHandler(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.category = "Admin"
         self._log_handler: ChannelLogHandler | None = None
+        self._hint_cooldowns: dict[int, float] = {}  # user_id -> monotonic time
 
     async def cog_load(self):
         global _bot_ref, _original_tree_on_error
@@ -307,6 +311,33 @@ class ErrorHandler(commands.Cog):
         self.bot.tree.on_error = _on_app_command_error
 
         logger.info("[ErrorHandler] Installed — logging handler, View/Modal error monkeypatch, and tree.on_error chained (original handler preserved) all active.")
+
+    # --- command-channel hint (merged from command_channel_hint.py) ---
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.channel.id != WATCH_CHANNEL_ID:
+            return
+        if message.author.bot:
+            return
+        if not message.content.startswith("/"):
+            return
+
+        if REPLY_COOLDOWN_SECONDS > 0:
+            now = time.monotonic()
+            last = self._hint_cooldowns.get(message.author.id)
+            if last is not None and now - last < REPLY_COOLDOWN_SECONDS:
+                return
+            self._hint_cooldowns[message.author.id] = now
+
+        try:
+            await message.reply(
+                f"Commands live in <#{COMMANDS_CHANNEL_ID}>!",
+                mention_author=True,
+                allowed_mentions=discord.AllowedMentions(replied_user=True, users=False, roles=False, everyone=False),
+            )
+        except discord.HTTPException as e:
+            logger.warning(f"[CommandChannelHint] Couldn't reply to {message.author.id}: {type(e).__name__}: {e}")
 
     async def cog_unload(self):
         if self._log_handler is not None:

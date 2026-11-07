@@ -46,22 +46,19 @@ import os
 import time
 import asyncio
 import logging
-import aiohttp
-import aiosqlite
 import discord
 from datetime import datetime, timedelta, timezone
 from discord import app_commands
 from discord.ext import commands
 
+from utils.config import (
+    JELLYFIN_URL, DB_DIR,
+    STATS_DB_PATH, LINKS_DB_PATH,
+)
+from utils.jellyfin_api import JellyfinClient
+from utils.db import run_query, run_write, run_script
+
 logger = logging.getLogger("stats_cog")
-
-JELLYFIN_URL = "https://jellyfin.ushereats.com"
-JELLYFIN_API_KEY = "9cb945d0d38d45cb84fcc8a2e1541bd8"
-PLAYBACK_REPORTING_QUERY_URL = f"{JELLYFIN_URL}/user_usage_stats/submit_custom_query"
-
-DB_DIR = "/home/container/ushereats/DATABASES"
-STATS_DB_PATH = os.path.join(DB_DIR, "mystats.db")
-LINKS_DB_PATH = os.path.join(DB_DIR, "jellyfin_links.db")  # read-only, owned by the registry cogs
 
 COMPLETED_THRESHOLD = 0.9  # fraction of an item's runtime that counts as "completed"
 
@@ -86,15 +83,13 @@ async def _ensure_db():
     to come from Jellyfin's normal item endpoint and gets cached here
     since it never changes once an item exists)."""
     os.makedirs(DB_DIR, exist_ok=True)
-    async with aiosqlite.connect(STATS_DB_PATH) as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS item_runtime_cache (
-                item_id TEXT PRIMARY KEY,
-                runtime_seconds INTEGER NOT NULL,
-                cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await conn.commit()
+    await run_script(STATS_DB_PATH, """
+        CREATE TABLE IF NOT EXISTS item_runtime_cache (
+            item_id TEXT PRIMARY KEY,
+            runtime_seconds INTEGER NOT NULL,
+            cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
 
 async def _get_cached_runtimes_batch(item_ids: list[str]) -> dict[str, int]:
@@ -103,13 +98,10 @@ async def _get_cached_runtimes_batch(item_ids: list[str]) -> dict[str, int]:
     if not item_ids:
         return {}
     placeholders = ",".join("?" for _ in item_ids)
-    async with aiosqlite.connect(STATS_DB_PATH) as conn:
-        async with conn.execute(
-            f"SELECT item_id, runtime_seconds FROM item_runtime_cache WHERE item_id IN ({placeholders})",
-            item_ids,
-        ) as cursor:
-            rows = await cursor.fetchall()
-    return {row[0]: row[1] for row in rows}
+    rows = await run_query(STATS_DB_PATH,
+        f"SELECT item_id, runtime_seconds FROM item_runtime_cache WHERE item_id IN ({placeholders})",
+        item_ids)
+    return {r["item_id"]: r["runtime_seconds"] for r in rows}
 
 
 async def _cache_runtimes_batch(pairs: list[tuple[str, int]]):
@@ -117,65 +109,37 @@ async def _cache_runtimes_batch(pairs: list[tuple[str, int]]):
     are given, instead of one INSERT per item."""
     if not pairs:
         return
-    async with aiosqlite.connect(STATS_DB_PATH) as conn:
-        await conn.executemany(
+    for item_id, runtime in pairs:
+        await run_write(STATS_DB_PATH,
             "INSERT INTO item_runtime_cache (item_id, runtime_seconds) VALUES (?, ?) "
             "ON CONFLICT(item_id) DO UPDATE SET runtime_seconds=excluded.runtime_seconds",
-            pairs,
-        )
-        await conn.commit()
+            (item_id, runtime))
 
 
 async def _get_link_by_discord_id(discord_id: int) -> dict | None:
-    async with aiosqlite.connect(LINKS_DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT * FROM links WHERE discord_id = ?", (discord_id,)) as cursor:
-            row = await cursor.fetchone()
-    return dict(row) if row else None
+    rows = await run_query(LINKS_DB_PATH, "SELECT * FROM links WHERE discord_id = ?", (discord_id,))
+    return rows[0] if rows else None
 
 
 async def _get_link_by_jellyfin_user_id(jellyfin_user_id: str) -> dict | None:
-    async with aiosqlite.connect(LINKS_DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT * FROM links WHERE jellyfin_user_id = ?", (jellyfin_user_id,)) as cursor:
-            row = await cursor.fetchone()
-    return dict(row) if row else None
+    rows = await run_query(LINKS_DB_PATH, "SELECT * FROM links WHERE jellyfin_user_id = ?", (jellyfin_user_id,))
+    return rows[0] if rows else None
 
 
-# --- SHARED JELLYFIN HTTP SESSION ---
-# No longer owned by this module — shared across the whole bot process
-# via bot.http_session (created once in main.py's setup_hook). _bot_ref
-# is set once in cog_load; _get_jellyfin_session() keeps its original
-# async signature so every existing call site below needed zero changes.
-_bot_ref = None
-
-
-async def _get_jellyfin_session() -> aiohttp.ClientSession:
-    return _bot_ref.http_session
+# --- SHARED JELLYFIN CLIENT ---
+# Set once in cog_load; module-level so all helpers can use it.
+_jf: JellyfinClient | None = None
 
 
 async def _fetch_all_jellyfin_users() -> list[dict]:
-    headers = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"', "accept": "application/json"}
-    session = await _get_jellyfin_session()
     try:
-        async with session.get(f"{JELLYFIN_URL}/Users", headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                return []
-            return await resp.json()
+        return await _jf.get_users()
     except Exception:
         return []
 
 
 async def _fetch_jellyfin_user(jellyfin_user_id: str) -> dict | None:
-    headers = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"', "accept": "application/json"}
-    session = await _get_jellyfin_session()
-    try:
-        async with session.get(f"{JELLYFIN_URL}/Users/{jellyfin_user_id}", headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                return None
-            return await resp.json()
-    except Exception:
-        return None
+    return await _jf.get_user(jellyfin_user_id)
 
 
 def _ticks_to_seconds(ticks) -> float:
@@ -194,29 +158,8 @@ async def _query_playback_reporting(sql: str) -> list[dict] | None:
     """POSTs a raw SQL query to Playback Reporting's custom-query
     endpoint and returns the results as a list of dicts. Returns None on
     any failure (unreachable, non-200, bad JSON) — callers treat that as
-    'couldn't get an answer', not as 'the answer is empty/zero'.
-
-    Response shape (confirmed against the live plugin): {"colums": [...],
-    "results": [[...], ...], "message": ""} — note "colums" is the
-    plugin's own spelling, not a typo introduced here."""
-    headers = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"', "accept": "application/json"}
-    session = await _get_jellyfin_session()
-    try:
-        async with session.post(
-            PLAYBACK_REPORTING_QUERY_URL, headers=headers,
-            json={"CustomQueryString": sql}, timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            if resp.status != 200:
-                logger.error(f"[MyStats] Playback Reporting query failed: HTTP {resp.status}")
-                return None
-            data = await resp.json()
-    except Exception as e:
-        logger.error(f"[MyStats] Playback Reporting query failed: {type(e).__name__}: {e}")
-        return None
-
-    columns = data.get("colums") or data.get("columns") or []
-    rows = data.get("results") or []
-    return [dict(zip(columns, row)) for row in rows]
+    'couldn't get an answer', not as 'the answer is empty/zero'."""
+    return await _jf.playback_query(sql)
 
 
 async def _get_watch_totals(jellyfin_user_id: str) -> dict:
@@ -303,19 +246,15 @@ async def _fetch_items_runtime_batch(item_ids: list[str]) -> dict[str, int]:
     guard against)."""
     if not item_ids:
         return {}
-    headers = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"', "accept": "application/json"}
-    session = await _get_jellyfin_session()
     result: dict[str, int] = {}
     CHUNK_SIZE = 200
 
     for i in range(0, len(item_ids), CHUNK_SIZE):
         chunk = item_ids[i:i + CHUNK_SIZE]
-        params = {"Ids": ",".join(chunk)}
         try:
-            async with session.get(f"{JELLYFIN_URL}/Items", headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    continue
-                data = await resp.json()
+            data = await _jf.get_json("/Items", params={"Ids": ",".join(chunk)})
+            if data is None:
+                continue
         except Exception as e:
             logger.warning(f"[MyStats] Batch runtime fetch failed for a chunk of {len(chunk)} item(s): {type(e).__name__}: {e}")
             continue
@@ -433,7 +372,6 @@ async def _fetch_recent_watches(jellyfin_user_id: str, limit: int = 3) -> list[d
     slightly larger fetch) surfaces in-progress watches too. Unrelated to
     the Playback Reporting rewrite above — this always came from a normal
     Jellyfin Items query, not the old tracking table."""
-    headers = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"', "accept": "application/json"}
     params = {
         "SortBy": "DatePlayed",
         "SortOrder": "Descending",
@@ -441,13 +379,11 @@ async def _fetch_recent_watches(jellyfin_user_id: str, limit: int = 3) -> list[d
         "Limit": "50",
         "Fields": "UserData,RunTimeTicks,ProductionYear,SeriesName,ParentIndexNumber,IndexNumber",
     }
-    session = await _get_jellyfin_session()
     try:
-        async with session.get(f"{JELLYFIN_URL}/Users/{jellyfin_user_id}/Items", headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                return []
-            data = await resp.json()
-            items = data.get("Items", [])
+        data = await _jf.get_json(f"/Users/{jellyfin_user_id}/Items", params=params)
+        if data is None:
+            return []
+        items = data.get("Items", [])
     except Exception:
         return []
 
@@ -524,8 +460,8 @@ class JellyfinStats(commands.Cog):
         # or handles any playback events from dashboard.py's SSE stream.
 
     async def cog_load(self):
-        global _bot_ref
-        _bot_ref = self.bot
+        global _jf
+        _jf = JellyfinClient(self.bot)
         await _ensure_db()
 
     async def cog_unload(self):

@@ -54,7 +54,6 @@ SECURITY — a user can only ever see or control their own playback:
   user (library access respected); only a panel's owner can press it.
 """
 
-import os
 import json
 import time
 import asyncio
@@ -62,22 +61,17 @@ import logging
 from datetime import datetime
 
 import aiohttp
-import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from utils.config import JELLYFIN_URL, JELLYFIN_API_KEY, LOG_CHANNEL_ID, LINKS_DB_PATH, REMOTE_DB_PATH
+from utils.db import Database, run_query, run_write, run_script
+
 logger = logging.getLogger("remote_cog")
 
-JELLYFIN_URL = "https://jellyfin.ushereats.com"
-JELLYFIN_WS_URL = "wss://jellyfin.ushereats.com/socket"
-JELLYFIN_API_KEY = "9cb945d0d38d45cb84fcc8a2e1541bd8"
-LOG_CHANNEL_ID = 1539141762600402994
+JELLYFIN_WS_URL = JELLYFIN_URL.replace("https://", "wss://").replace("http://", "ws://") + "/socket"
 REMOTE_CHANNEL_ID = 1556565053166190662  # where the shared panel lives
-
-DB_DIR = "/home/container/ushereats/DATABASES"
-LINKS_DB_PATH = os.path.join(DB_DIR, "jellyfin_links.db")  # read-only here, owned by the registry cog
-REMOTE_DB_PATH = os.path.join(DB_DIR, "remote.db")  # this cog's own state (panel message id)
 
 # --- tuning ---
 ACTIVE_WINDOW_SECONDS = 120  # a session counts as open if it checked in this recently
@@ -1091,8 +1085,7 @@ class Remote(commands.Cog):
         self.client = JellyfinClient(bot)
         self.feed = SessionFeed(self)
         self.controllers: dict[int, RemoteController] = {}
-        self._links_db: aiosqlite.Connection | None = None
-        self._db: aiosqlite.Connection | None = None
+        self._db: Database | None = None
         self._link_cache: dict[int, tuple[str | None, float]] = {}
         self._search_cache: dict[tuple[str, str], tuple[list[dict], float]] = {}
         self._command_locks: dict[int, asyncio.Lock] = {}
@@ -1106,12 +1099,8 @@ class Remote(commands.Cog):
         self._qc_tasks: set[asyncio.Task] = set()
 
     async def cog_load(self):
-        if not os.path.exists(LINKS_DB_PATH):
-            raise RuntimeError(f"[Remote] Database not found at {LINKS_DB_PATH}")
-        self._links_db = await aiosqlite.connect(LINKS_DB_PATH)
-        self._db = await aiosqlite.connect(REMOTE_DB_PATH)
+        self._db = await Database(REMOTE_DB_PATH).open()
         await self._db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        await self._db.commit()
         self._shared_view = SharedPanelView()
         self.bot.add_view(self._shared_view)
         logger.info("[Remote] Loaded — single-card panel version.")

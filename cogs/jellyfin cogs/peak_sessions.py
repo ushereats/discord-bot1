@@ -24,37 +24,25 @@ Peak Streams Cog (live recording)
   Sydney regardless of where the bot runs.
 """
 
-import os
 import time
 import logging
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
-import aiohttp
-import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from utils.config import OWNER_DISCORD_ID, PEAK_DB_PATH as DB_PATH, TIMEZONE
+from utils.jellyfin_api import JellyfinClient
+from utils.db import Database
+
 logger = logging.getLogger("peak_streams_cog")
-
-OWNER_DISCORD_ID = 723417665087078451
-JELLYFIN_URL = "https://jellyfin.ushereats.com"
-JELLYFIN_API_KEY = "9cb945d0d38d45cb84fcc8a2e1541bd8"
-
-DB_DIR = "/home/container/ushereats/DATABASES"
-DB_PATH = os.path.join(DB_DIR, "peak_streams.db")
-
-TIMEZONE = ZoneInfo("Australia/Sydney")
 DAYS = 7
 SAMPLE_INTERVAL_SECONDS = 60
 # Sessions whose client hasn't checked in for this long are treated as
 # gone. Open players (paused included) keep reporting to Jellyfin, so
 # this only drops dead sessions left behind by a crashed app.
 ACTIVE_WITHIN_SECONDS = 600
-
-_JF_HEADERS = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"', "accept": "application/json"}
-_JF_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 
 def _today() -> str:
@@ -65,15 +53,15 @@ class PeakStreams(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.category = "Admin"
-        self._db: aiosqlite.Connection | None = None
+        self.jf = JellyfinClient(bot)
+        self._db = Database(DB_PATH, row_factory=False)
         # Today's recorded peak, cached so the database is only written
         # when a NEW high is reached, not every minute.
         self._cached_day: str | None = None
         self._cached_peak: int = 0
 
     async def cog_load(self):
-        os.makedirs(DB_DIR, exist_ok=True)
-        self._db = await aiosqlite.connect(DB_PATH)
+        await self._db.open()
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS daily_peaks (
                 day TEXT PRIMARY KEY,
@@ -81,7 +69,6 @@ class PeakStreams(commands.Cog):
                 peak_at INTEGER NOT NULL
             )
         """)
-        await self._db.commit()
         if not self.sample_loop.is_running():
             self.sample_loop.start()
 
@@ -93,9 +80,7 @@ class PeakStreams(commands.Cog):
                 await task
             except BaseException:
                 pass
-        if self._db is not None:
-            await self._db.close()
-            self._db = None
+        await self._db.close()
 
     # --- live count ---
 
@@ -103,16 +88,7 @@ class PeakStreams(commands.Cog):
         """Number of sessions with something open (playing or paused).
         None if Jellyfin couldn't be reached."""
         try:
-            async with self.bot.http_session.get(
-                f"{JELLYFIN_URL}/Sessions",
-                headers=_JF_HEADERS,
-                params={"activeWithinSeconds": str(ACTIVE_WITHIN_SECONDS)},
-                timeout=_JF_TIMEOUT,
-            ) as resp:
-                if resp.status != 200:
-                    logger.warning(f"[PeakStreams] /Sessions returned HTTP {resp.status}")
-                    return None
-                sessions = await resp.json()
+            sessions = await self.jf.get_sessions(active_within=ACTIVE_WITHIN_SECONDS)
         except Exception as e:
             logger.warning(f"[PeakStreams] /Sessions failed: {type(e).__name__}: {e}")
             return None
@@ -122,7 +98,7 @@ class PeakStreams(commands.Cog):
         day = _today()
         if day != self._cached_day:
             self._cached_day = day
-            async with self._db.execute("SELECT peak FROM daily_peaks WHERE day = ?", (day,)) as cursor:
+            async with self._db.conn.execute("SELECT peak FROM daily_peaks WHERE day = ?", (day,)) as cursor:
                 row = await cursor.fetchone()
             self._cached_peak = row[0] if row else -1  # -1: nothing stored yet, so even 0 gets recorded
 
@@ -134,7 +110,6 @@ class PeakStreams(commands.Cog):
             "WHERE excluded.peak > daily_peaks.peak",
             (day, count, int(time.time())),
         )
-        await self._db.commit()
         self._cached_peak = count
 
     @tasks.loop(seconds=SAMPLE_INTERVAL_SECONDS)
@@ -165,7 +140,7 @@ class PeakStreams(commands.Cog):
         keys = [d.strftime("%Y-%m-%d") for d in days]
 
         placeholders = ",".join("?" for _ in keys)
-        async with self._db.execute(
+        async with self._db.conn.execute(
             f"SELECT day, peak, peak_at FROM daily_peaks WHERE day IN ({placeholders})", keys,
         ) as cursor:
             stored = {day: (peak, peak_at) for day, peak, peak_at in await cursor.fetchall()}

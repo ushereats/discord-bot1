@@ -28,35 +28,50 @@ Jellyfin Registry Dashboard Cog
   4. All database access goes through aiosqlite instead of blocking
      sqlite3, so a DB read/write here can't stall the bot's event loop.
 
-Config: set JELLYFIN_URL and JELLYFIN_API_KEY below (same values as the
-other Jellyfin cogs).
+Config: constants are imported from utils.config.
 """
 
-import os
 import logging
-import aiohttp
-import aiosqlite
 import discord
 from datetime import datetime
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from utils.config import (
+    TARGET_GUILD_ID, OWNER_DISCORD_ID, LINKS_DB_PATH,
+)
+from utils.jellyfin_api import JellyfinClient
+from utils.db import run_query, run_write, run_script
+
 logger = logging.getLogger("registry_dashboard_cog")
-
-TARGET_GUILD_ID = 1537023658323869757
-JELLYFIN_URL = "https://jellyfin.ushereats.com"
-JELLYFIN_API_KEY = "9cb945d0d38d45cb84fcc8a2e1541bd8"
-
-DB_DIR = "/home/container/ushereats/DATABASES"
-DB_PATH = os.path.join(DB_DIR, "jellyfin_links.db")
 
 DASHBOARD_LOOP_MINUTES = 5
 PAGE_SIZE = 40
-OWNER_DISCORD_ID = 723417665087078451
 
 # Mentions on the dashboard render as normal blue clickable names but never
 # ping anyone — passed to every send/edit of the dashboard message.
 NO_PINGS = discord.AllowedMentions.none()
+
+
+_ENSURE_DB_SQL = """
+CREATE TABLE IF NOT EXISTS links (
+    discord_id INTEGER PRIMARY KEY,
+    jellyfin_user_id TEXT NOT NULL,
+    linked_by INTEGER NOT NULL,
+    linked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS registry_dashboard_config (
+    guild_id INTEGER PRIMARY KEY,
+    dashboard_channel_id INTEGER,
+    dashboard_message_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS signup_tokens (
+    discord_id INTEGER PRIMARY KEY,
+    issued_by INTEGER NOT NULL,
+    issued_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    message_id INTEGER
+);
+"""
 
 
 async def _ensure_db():
@@ -64,95 +79,55 @@ async def _ensure_db():
     Both cogs call this independently on load — CREATE TABLE IF NOT EXISTS
     is idempotent, so it's safe regardless of which cog loads first, and
     neither depends on the other having run yet."""
-    os.makedirs(DB_DIR, exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS links (
-                discord_id INTEGER PRIMARY KEY,
-                jellyfin_user_id TEXT NOT NULL,
-                linked_by INTEGER NOT NULL,
-                linked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS registry_dashboard_config (
-                guild_id INTEGER PRIMARY KEY,
-                dashboard_channel_id INTEGER,
-                dashboard_message_id INTEGER
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS signup_tokens (
-                discord_id INTEGER PRIMARY KEY,
-                issued_by INTEGER NOT NULL,
-                issued_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                message_id INTEGER
-            )
-        """)
-        await conn.commit()
+    await run_script(LINKS_DB_PATH, _ENSURE_DB_SQL)
 
 
 async def _get_all_links() -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT * FROM links") as cursor:
-            rows = await cursor.fetchall()
-    return [dict(r) for r in rows]
+    return await run_query(LINKS_DB_PATH, "SELECT * FROM links")
 
 
 async def _get_dashboard_config(guild_id: int) -> dict:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute(
-            "SELECT guild_id, dashboard_channel_id, dashboard_message_id FROM registry_dashboard_config WHERE guild_id=?",
-            (guild_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-    if row is None:
+    rows = await run_query(
+        LINKS_DB_PATH,
+        "SELECT guild_id, dashboard_channel_id, dashboard_message_id FROM registry_dashboard_config WHERE guild_id=?",
+        (guild_id,),
+    )
+    if not rows:
         return {"guild_id": guild_id, "dashboard_channel_id": None, "dashboard_message_id": None}
-    return dict(row)
+    return rows[0]
 
 
 async def _upsert_dashboard_config(guild_id: int, **fields):
-    async with aiosqlite.connect(DB_PATH) as conn:
-        async with conn.execute(
-            "SELECT guild_id FROM registry_dashboard_config WHERE guild_id=?", (guild_id,)
-        ) as cursor:
-            existing = await cursor.fetchone()
-
-        if existing is None:
-            columns = ["guild_id"] + list(fields.keys())
-            placeholders = ", ".join(["?"] * len(columns))
-            values = [guild_id] + list(fields.values())
-            await conn.execute(
-                f"INSERT INTO registry_dashboard_config ({', '.join(columns)}) VALUES ({placeholders})",
-                tuple(values),
-            )
-        else:
-            set_clause = ", ".join(f"{k}=?" for k in fields.keys())
-            values = list(fields.values()) + [guild_id]
-            await conn.execute(f"UPDATE registry_dashboard_config SET {set_clause} WHERE guild_id=?", tuple(values))
-        await conn.commit()
-
-
-# --- SHARED JELLYFIN HTTP SESSION ---
-# No longer owned by this module — shared across the whole bot process
-# via bot.http_session (created once in main.py's setup_hook). _bot_ref
-# is set once in cog_load; _get_jellyfin_session() keeps its original
-# async signature so the one call site below needed zero changes.
-_bot_ref = None
+    existing = await run_query(
+        LINKS_DB_PATH,
+        "SELECT guild_id FROM registry_dashboard_config WHERE guild_id=?",
+        (guild_id,),
+    )
+    if not existing:
+        columns = ["guild_id"] + list(fields.keys())
+        placeholders = ", ".join(["?"] * len(columns))
+        values = [guild_id] + list(fields.values())
+        await run_write(
+            LINKS_DB_PATH,
+            f"INSERT INTO registry_dashboard_config ({', '.join(columns)}) VALUES ({placeholders})",
+            tuple(values),
+        )
+    else:
+        set_clause = ", ".join(f"{k}=?" for k in fields.keys())
+        values = list(fields.values()) + [guild_id]
+        await run_write(
+            LINKS_DB_PATH,
+            f"UPDATE registry_dashboard_config SET {set_clause} WHERE guild_id=?",
+            tuple(values),
+        )
 
 
-async def _get_jellyfin_session() -> aiohttp.ClientSession:
-    return _bot_ref.http_session
+# Module-level JellyfinClient, initialized in cog_load.
+_jf: JellyfinClient | None = None
 
 
 async def _fetch_jellyfin_users() -> list[dict]:
-    headers = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"', "accept": "application/json"}
-    session = await _get_jellyfin_session()
-    async with session.get(f"{JELLYFIN_URL}/Users", headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-        resp.raise_for_status()
-        return await resp.json()
+    return await _jf.get_users()
 
 
 def _last_activity_ts(user: dict) -> int | None:
@@ -515,8 +490,8 @@ class JellyfinRegistryDashboard(commands.Cog):
         # _ensure_db() is async (aiosqlite) now — moved to cog_load.
 
     async def cog_load(self):
-        global _bot_ref
-        _bot_ref = self.bot
+        global _jf
+        _jf = JellyfinClient(self.bot)
         await _ensure_db()
         # Registers the fixed custom_ids (registry_page_prev/label/next) so
         # clicks on an already-sent dashboard message still work immediately

@@ -38,20 +38,19 @@ import asyncio
 import logging
 import time
 
-import aiohttp
-import aiosqlite
 import discord
 from discord.ext import commands, tasks
 
+from utils.config import (
+    TARGET_GUILD_ID,
+    WATCHING_ROLE_ID,
+    BROWSING_ROLE_ID,
+    LINKS_DB_PATH,
+)
+from utils.jellyfin_api import JellyfinClient
+from utils.db import run_query
+
 logger = logging.getLogger("watching_role_cog")
-
-JELLYFIN_URL = "https://jellyfin.ushereats.com"
-JELLYFIN_API_KEY = "9cb945d0d38d45cb84fcc8a2e1541bd8"
-TARGET_GUILD_ID = 1537023658323869757
-WATCHING_ROLE_ID = 1539199204017315911
-BROWSING_ROLE_ID = 1540324328996872203
-
-DB_PATH = "/home/container/ushereats/DATABASES/jellyfin_links.db"
 
 # Paused still counts as watching — only stopping playback drops it.
 COUNT_PAUSED_AS_WATCHING = True
@@ -63,7 +62,6 @@ POLL_SECONDS = 60
 # someone closes the app.
 ACTIVE_WITHIN_SECONDS = 960
 
-REQUEST_TIMEOUT_SECONDS = 10
 LINKS_CACHE_SECONDS = 60
 # Gap between individual role edits. The first run after this update may
 # need to clean up ~130 members; 0.5s keeps that well clear of Discord's
@@ -76,6 +74,7 @@ EVENT_COALESCE_SECONDS = 1.0
 class JellyfinWatchingRole(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.jf = JellyfinClient(self.bot)
         # --- single shared state, updated by BOTH live events and the poll ---
         self._watch_sessions: dict[str, str] = {}   # sessionId -> jellyfin userId, sessions currently playing
         self._active_users: set[str] = set()        # jellyfin userIds active within the window
@@ -175,16 +174,8 @@ class JellyfinWatchingRole(commands.Cog):
         logger.error(f"[WatchingRole] poll_loop crashed: {type(error).__name__}: {error}", exc_info=error)
 
     async def _fetch_active_sessions(self) -> list | None:
-        headers = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"', "accept": "application/json"}
         try:
-            async with self.bot.http_session.get(
-                f"{JELLYFIN_URL}/Sessions",
-                headers=headers,
-                params={"activeWithinSeconds": ACTIVE_WITHIN_SECONDS},
-                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS),
-            ) as resp:
-                resp.raise_for_status()
-                return await resp.json()
+            return await self.jf.get_sessions(active_within=ACTIVE_WITHIN_SECONDS)
         except Exception as e:
             logger.error(f"[WatchingRole] REST /Sessions fetch failed: {type(e).__name__}: {e}")
             return None
@@ -193,15 +184,13 @@ class JellyfinWatchingRole(commands.Cog):
         if not force and self._links and time.time() - self._links_loaded_at < LINKS_CACHE_SECONDS:
             return
         try:
-            async with aiosqlite.connect(DB_PATH, timeout=5) as conn:
-                async with conn.execute("SELECT discord_id, jellyfin_user_id FROM links") as cursor:
-                    rows = await cursor.fetchall()
+            rows = await run_query(LINKS_DB_PATH, "SELECT discord_id, jellyfin_user_id FROM links")
         except Exception as e:
             logger.error(f"[WatchingRole] DB read failed, keeping previous links: {type(e).__name__}: {e}")
             return
         links: dict[str, list[int]] = {}
-        for discord_id, jf_id in rows:
-            links.setdefault(_norm_id(jf_id), []).append(int(discord_id))
+        for row in rows:
+            links.setdefault(_norm_id(row["jellyfin_user_id"]), []).append(int(row["discord_id"]))
         self._links = links
         self._links_loaded_at = time.time()
 

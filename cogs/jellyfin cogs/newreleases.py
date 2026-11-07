@@ -184,14 +184,13 @@ New Media Announcer Cog (Tracearr SSE-driven)
   Jellyfin/the proxy returns as HTTP 414 — chunking keeps each request's
   URL short regardless of how many IDs are involved overall.
 
-Config: set CHANNEL_ID, JELLYFIN_URL, and JELLYFIN_API_KEY below.
+Config: CHANNEL_ID is set below; JELLYFIN_URL and JELLYFIN_API_KEY come from utils.config.
 Requires imageio-ffmpeg in requirements.txt for the screenshot feature.
 """
 
 import os
 import tempfile
 import io
-import aiosqlite
 import discord
 import aiohttp
 import asyncio
@@ -203,13 +202,17 @@ import imageio_ffmpeg
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from utils.config import (
+    JELLYFIN_URL, JELLYFIN_API_KEY, OWNER_DISCORD_ID,
+    DB_DIR, NEW_MEDIA_DB_PATH,
+)
+from utils.jellyfin_api import JellyfinClient
+from utils.db import run_query, run_write, run_script
+
 logger = logging.getLogger("new_media_cog")
 
 # --- CONFIG ---
 CHANNEL_ID = 1539939421032284190  # <-- set this to the channel you want new-media announcements posted in
-JELLYFIN_URL = "https://jellyfin.ushereats.com"
-JELLYFIN_API_KEY = "9cb945d0d38d45cb84fcc8a2e1541bd8"
-OWNER_DISCORD_ID = 723417665087078451
 
 # How long to wait after the last item-added event before actually posting
 # — lets a whole season dump (many individual episode-added events) group
@@ -387,8 +390,7 @@ SCREENSHOT_SWEEP_PACE_SECONDS = 2.0
 SCREENSHOT_CIRCUIT_BREAKER_THRESHOLD = 5
 SCREENSHOT_CIRCUIT_BREAKER_COOLDOWN_SECONDS = 600  # 10 minutes
 
-DB_DIR = "/home/container/ushereats/DATABASES"
-DB_PATH = os.path.join(DB_DIR, "new_media.db")
+DB_PATH = NEW_MEDIA_DB_PATH
 
 # Screenshot temp files go HERE, not the system default
 # (tempfile.gettempdir(), almost always /tmp) — /tmp inside this
@@ -454,70 +456,55 @@ def _extract_announcement_parts(message: discord.Message) -> tuple[str, list[str
 # for tracking the open series-rollup window so later episodes of the same
 # series edit the existing message instead of posting a new one) ---
 #
-# aiosqlite throughout, not blocking sqlite3 — a blocking DB call inside an
-# async function freezes the ENTIRE bot's event loop for its duration, not
-# just this cog. Every other cog with any DB access in this codebase
-# (daily.py, stickymessage.py, the fixed watchingnowroleadder.py) already
-# uses aiosqlite for exactly this reason; this file was the one holdout.
 async def _ensure_db():
     os.makedirs(DB_DIR, exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS announcements (
-                message_id INTEGER PRIMARY KEY,
-                channel_id INTEGER NOT NULL,
-                group_type TEXT NOT NULL,
-                item_ids TEXT NOT NULL,
-                posted_at INTEGER NOT NULL,
-                quality_image_url TEXT,
-                series_id TEXT,
-                rollup_expires_at INTEGER
-            )
-        """)
-        # Backward-compatible migrations for a DB created before these
-        # columns existed — each ignored individually if already present.
-        for ddl in (
-            "ALTER TABLE announcements ADD COLUMN quality_image_url TEXT",
-            "ALTER TABLE announcements ADD COLUMN series_id TEXT",
-            "ALTER TABLE announcements ADD COLUMN rollup_expires_at INTEGER",
-            "ALTER TABLE announcements ADD COLUMN locked INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE announcements ADD COLUMN last_sync_signature TEXT",
-        ):
-            try:
-                await conn.execute(ddl)
-            except aiosqlite.OperationalError:
-                pass
-        await conn.commit()
+    await run_script(DB_PATH, """
+        CREATE TABLE IF NOT EXISTS announcements (
+            message_id INTEGER PRIMARY KEY,
+            channel_id INTEGER NOT NULL,
+            group_type TEXT NOT NULL,
+            item_ids TEXT NOT NULL,
+            posted_at INTEGER NOT NULL,
+            quality_image_url TEXT,
+            series_id TEXT,
+            rollup_expires_at INTEGER
+        );
+    """)
+    # Backward-compatible migrations — each ignored individually if already present.
+    import sqlite3
+    for ddl in (
+        "ALTER TABLE announcements ADD COLUMN quality_image_url TEXT",
+        "ALTER TABLE announcements ADD COLUMN series_id TEXT",
+        "ALTER TABLE announcements ADD COLUMN rollup_expires_at INTEGER",
+        "ALTER TABLE announcements ADD COLUMN locked INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE announcements ADD COLUMN last_sync_signature TEXT",
+    ):
+        try:
+            await run_write(DB_PATH, ddl)
+        except sqlite3.OperationalError:
+            pass
 
 
 async def _record_announcement(message_id: int, channel_id: int, group_type: str, item_ids: list[str],
                                 posted_at: int, series_id: str | None = None, rollup_expires_at: int | None = None):
-    async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute(
-            "INSERT OR REPLACE INTO announcements "
-            "(message_id, channel_id, group_type, item_ids, posted_at, quality_image_url, series_id, rollup_expires_at) "
-            "VALUES (?, ?, ?, ?, ?, (SELECT quality_image_url FROM announcements WHERE message_id = ?), ?, ?)",
-            (message_id, channel_id, group_type, ",".join(item_ids), posted_at, message_id, series_id, rollup_expires_at),
-        )
-        await conn.commit()
+    await run_write(
+        DB_PATH,
+        "INSERT OR REPLACE INTO announcements "
+        "(message_id, channel_id, group_type, item_ids, posted_at, quality_image_url, series_id, rollup_expires_at) "
+        "VALUES (?, ?, ?, ?, ?, (SELECT quality_image_url FROM announcements WHERE message_id = ?), ?, ?)",
+        (message_id, channel_id, group_type, ",".join(item_ids), posted_at, message_id, series_id, rollup_expires_at),
+    )
 
 
 async def _get_announcement(message_id: int) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT * FROM announcements WHERE message_id = ?", (message_id,)) as cursor:
-            row = await cursor.fetchone()
-    return dict(row) if row else None
+    rows = await run_query(DB_PATH, "SELECT * FROM announcements WHERE message_id = ?", (message_id,))
+    return rows[0] if rows else None
 
 
 async def _get_all_announcements() -> list[dict]:
     """Every stored announcement, oldest first — used by /syncmedia to
     refresh everything in one pass instead of one message_id at a time."""
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT * FROM announcements ORDER BY posted_at ASC") as cursor:
-            rows = await cursor.fetchall()
-    return [dict(r) for r in rows]
+    return await run_query(DB_PATH, "SELECT * FROM announcements ORDER BY posted_at ASC")
 
 
 async def _get_open_series_announcement(series_id: str) -> dict | None:
@@ -525,16 +512,14 @@ async def _get_open_series_announcement(series_id: str) -> dict | None:
     window hasn't expired yet. Only ever one should exist at a time per
     series in practice, but ordered by most recent just in case."""
     now = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute(
-            "SELECT * FROM announcements WHERE group_type = 'series' AND series_id = ? "
-            "AND rollup_expires_at IS NOT NULL AND rollup_expires_at > ? "
-            "ORDER BY posted_at DESC LIMIT 1",
-            (series_id, now),
-        ) as cursor:
-            row = await cursor.fetchone()
-    return dict(row) if row else None
+    rows = await run_query(
+        DB_PATH,
+        "SELECT * FROM announcements WHERE group_type = 'series' AND series_id = ? "
+        "AND rollup_expires_at IS NOT NULL AND rollup_expires_at > ? "
+        "ORDER BY posted_at DESC LIMIT 1",
+        (series_id, now),
+    )
+    return rows[0] if rows else None
 
 
 async def _update_announcement_item_ids(message_id: int, item_ids: list[str], rollup_expires_at: int | None = None):
@@ -544,21 +529,18 @@ async def _update_announcement_item_ids(message_id: int, item_ids: list[str], ro
     the rollup window ROLL forward on every new episode instead of
     staying fixed from whenever the announcement was first posted (see
     the module docstring's "SERIES ROLLUP WINDOW" section)."""
-    async with aiosqlite.connect(DB_PATH) as conn:
-        if rollup_expires_at is not None:
-            await conn.execute(
-                "UPDATE announcements SET item_ids = ?, rollup_expires_at = ? WHERE message_id = ?",
-                (",".join(item_ids), rollup_expires_at, message_id),
-            )
-        else:
-            await conn.execute("UPDATE announcements SET item_ids = ? WHERE message_id = ?", (",".join(item_ids), message_id))
-        await conn.commit()
+    if rollup_expires_at is not None:
+        await run_write(
+            DB_PATH,
+            "UPDATE announcements SET item_ids = ?, rollup_expires_at = ? WHERE message_id = ?",
+            (",".join(item_ids), rollup_expires_at, message_id),
+        )
+    else:
+        await run_write(DB_PATH, "UPDATE announcements SET item_ids = ? WHERE message_id = ?", (",".join(item_ids), message_id))
 
 
 async def _set_quality_image(message_id: int, image_url: str):
-    async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute("UPDATE announcements SET quality_image_url = ? WHERE message_id = ?", (image_url, message_id))
-        await conn.commit()
+    await run_write(DB_PATH, "UPDATE announcements SET quality_image_url = ? WHERE message_id = ?", (image_url, message_id))
 
 
 async def _set_locked(message_id: int, locked: bool):
@@ -567,9 +549,7 @@ async def _set_locked(message_id: int, locked: bool):
     (wrong episode names, bad metadata, whatever) via /embededit or by
     hand, then protect that fix from being silently overwritten the next
     time /syncmedia rebuilds everything from stored Jellyfin data."""
-    async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute("UPDATE announcements SET locked = ? WHERE message_id = ?", (1 if locked else 0, message_id))
-        await conn.commit()
+    await run_write(DB_PATH, "UPDATE announcements SET locked = ? WHERE message_id = ?", (1 if locked else 0, message_id))
 
 
 async def _delete_announcement(message_id: int):
@@ -581,15 +561,11 @@ async def _delete_announcement(message_id: int):
     will never exist again just sits there forever otherwise, making
     every future /syncmedia run slower and its counts more confusing for
     no benefit — a dead row can never be synced again by definition."""
-    async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute("DELETE FROM announcements WHERE message_id = ?", (message_id,))
-        await conn.commit()
+    await run_write(DB_PATH, "DELETE FROM announcements WHERE message_id = ?", (message_id,))
 
 
 async def _set_sync_signature(message_id: int, signature: str):
-    async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute("UPDATE announcements SET last_sync_signature = ? WHERE message_id = ?", (signature, message_id))
-        await conn.commit()
+    await run_write(DB_PATH, "UPDATE announcements SET last_sync_signature = ? WHERE message_id = ?", (signature, message_id))
 
 
 async def _get_announcements_missing_screenshot() -> list[dict]:
@@ -599,13 +575,10 @@ async def _get_announcements_missing_screenshot() -> list[dict]:
     failed on. Locked rows are respected the same way /syncmedia
     respects them — an owner locked it deliberately, this sweep
     shouldn't touch it either."""
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute(
-            "SELECT * FROM announcements WHERE (quality_image_url IS NULL OR quality_image_url = '') AND locked = 0"
-        ) as cursor:
-            rows = await cursor.fetchall()
-    return [dict(r) for r in rows]
+    return await run_query(
+        DB_PATH,
+        "SELECT * FROM announcements WHERE (quality_image_url IS NULL OR quality_image_url = '') AND locked = 0",
+    )
 
 
 def _compute_group_signature(group: dict) -> str:
@@ -627,19 +600,7 @@ def _compute_group_signature(group: dict) -> str:
     return "|".join(str(p) for p in parts)
 
 
-async def jellyfin_get(session: aiohttp.ClientSession, path: str, params: dict = None):
-    headers = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"', "accept": "application/json"}
-
-    try:
-        async with session.get(f"{JELLYFIN_URL}{path}", headers=headers, params=params or {}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                return None, f"Jellyfin returned status {resp.status} for `{path}`."
-            return await resp.json(), None
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
-
-
-async def jellyfin_get_items_batched(session: aiohttp.ClientSession, item_ids: list[str], fields: str) -> tuple[list[dict], str | None]:
+async def _jellyfin_get_items_batched(jf: JellyfinClient, item_ids: list[str], fields: str) -> tuple[list[dict], str | None]:
     """Fetches /Items for item_ids in chunks of ITEMS_CHUNK_SIZE instead of
     joining every ID into a single query string, avoiding HTTP 414 (URI
     Too Long) on large batches — a full season dump or a /syncmedia run
@@ -650,9 +611,10 @@ async def jellyfin_get_items_batched(session: aiohttp.ClientSession, item_ids: l
     all_items: list[dict] = []
     for i in range(0, len(item_ids), ITEMS_CHUNK_SIZE):
         chunk = item_ids[i:i + ITEMS_CHUNK_SIZE]
-        data, err = await jellyfin_get(session, "/Items", params={"Ids": ",".join(chunk), "Fields": fields})
-        if err:
-            return all_items, err
+        try:
+            data = await jf.get_json("/Items", params={"Ids": ",".join(chunk), "Fields": fields})
+        except Exception as e:
+            return all_items, f"{type(e).__name__}: {e}"
         all_items.extend((data or {}).get("Items", []))
     return all_items, None
 
@@ -1235,6 +1197,7 @@ class NewMediaAnnouncer(commands.Cog):
 
     async def cog_load(self):
         self.session = self.bot.http_session
+        self.jf = JellyfinClient(self.bot)
         await _ensure_db()
         # Registers the fixed custom_id so the button on any already-sent
         # message keeps working after a restart — same pattern as the
@@ -1642,7 +1605,7 @@ class NewMediaAnnouncer(commands.Cog):
         posted_at = int(msg.created_at.timestamp())
 
         if group_type == "movie":
-            items, err = await jellyfin_get_items_batched(self.session, [poster_id], ITEM_FIELDS)
+            items, err = await _jellyfin_get_items_batched(self.jf, [poster_id], ITEM_FIELDS)
             if err or not items or items[0].get("Type") != "Movie":
                 return False
             item_ids = [poster_id]
@@ -1652,11 +1615,14 @@ class NewMediaAnnouncer(commands.Cog):
             codes = {(int(s), int(e)) for s, e in _EPISODE_CODE_RE.findall(text)}
             if not codes:
                 return False
-            data, err = await jellyfin_get(
-                self.session, f"/Shows/{poster_id}/Episodes",
-                params={"Fields": "ParentIndexNumber,IndexNumber"},
-            )
-            if err or not data:
+            try:
+                data = await self.jf.get_json(
+                    f"/Shows/{poster_id}/Episodes",
+                    params={"Fields": "ParentIndexNumber,IndexNumber"},
+                )
+            except Exception:
+                return False
+            if not data:
                 return False
             item_ids = [
                 i["Id"] for i in data.get("Items", [])
@@ -1751,7 +1717,7 @@ class NewMediaAnnouncer(commands.Cog):
         # Batched fetch (chunked internally) for every queued item instead
         # of one call per item, and instead of one unchunked call that can
         # 414 on a large batch.
-        item_list, err = await jellyfin_get_items_batched(self.session, item_ids, ITEM_FIELDS)
+        item_list, err = await _jellyfin_get_items_batched(self.jf, item_ids, ITEM_FIELDS)
         if err:
             logger.error(f"[NewMedia] Failed to fetch new item details: {err}")
             return
@@ -2001,7 +1967,7 @@ class NewMediaAnnouncer(commands.Cog):
         signature needing to change everywhere else it's used
         (_handle_series_batch's edit path and _rebuild_group_from_record
         both ignore these two keys entirely)."""
-        item_list, err = await jellyfin_get_items_batched(self.session, item_ids, ITEM_FIELDS)
+        item_list, err = await _jellyfin_get_items_batched(self.jf, item_ids, ITEM_FIELDS)
         if err:
             logger.error(f"[NewMedia] Failed to fetch series item details: {err}")
             return None
@@ -2041,7 +2007,7 @@ class NewMediaAnnouncer(commands.Cog):
         if record["group_type"] == "series":
             return await self._build_series_group(item_ids)
 
-        item_list, err = await jellyfin_get_items_batched(self.session, item_ids, ITEM_FIELDS)
+        item_list, err = await _jellyfin_get_items_batched(self.jf, item_ids, ITEM_FIELDS)
         if err or not item_list:
             return None
         first = item_list[0]
@@ -2320,7 +2286,7 @@ class NewMediaAnnouncer(commands.Cog):
         if msg.author.id != self.bot.user.id:
             return await interaction.followup.send("❌ That message wasn't posted by this bot.", ephemeral=True)
 
-        items, err = await jellyfin_get_items_batched(self.session, [item_id], ITEM_FIELDS)
+        items, err = await _jellyfin_get_items_batched(self.jf, [item_id], ITEM_FIELDS)
         if err or not items:
             return await interaction.followup.send(f"❌ Jellyfin lookup failed: `{err or 'no item with that ID'}`", ephemeral=True)
 

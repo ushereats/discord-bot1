@@ -41,22 +41,19 @@ Daily Stats Cog (Playback Reporting-backed)
 import os
 import asyncio
 import logging
-import aiohttp
-import aiosqlite
 import discord
 from datetime import datetime, timezone, timedelta
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from utils.config import (
+    JELLYFIN_URL, DB_DIR,
+    DAILY_DB_PATH, LINKS_DB_PATH,
+)
+from utils.jellyfin_api import JellyfinClient
+from utils.db import run_query, run_write, run_script
+
 logger = logging.getLogger("daily_stats_cog")
-
-JELLYFIN_URL = "https://jellyfin.ushereats.com"
-JELLYFIN_API_KEY = "9cb945d0d38d45cb84fcc8a2e1541bd8"
-PLAYBACK_REPORTING_QUERY_URL = f"{JELLYFIN_URL}/user_usage_stats/submit_custom_query"
-
-DB_DIR = "/home/container/ushereats/DATABASES"
-DAILY_DB_PATH = os.path.join(DB_DIR, "daily_stats.db")
-LINKS_DB_PATH = os.path.join(DB_DIR, "jellyfin_links.db")  # read-only, owned by the registry cogs
 
 TOP_N = 10
 MAX_PLAUSIBLE_PLAY_DURATION_SECONDS = 24 * 3600
@@ -84,144 +81,81 @@ PERIOD_ORDER = ["daily", "weekly", "lifetime"]
 
 
 async def _ensure_db():
-    """Two tables, deliberately kept separate: daily_stats_config
-    (channel choice) predates per-message tracking — an earlier deployed
-    version created it WITHOUT a message_id column, and CREATE TABLE IF
-    NOT EXISTS never alters an existing table (confirmed in production:
-    'table daily_stats_config has no column named message_id').
-    daily_stats_messages always gets created correctly regardless of
-    what already exists on disk — no migration needed for either."""
     os.makedirs(DB_DIR, exist_ok=True)
-    async with aiosqlite.connect(DAILY_DB_PATH) as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS daily_stats_config (
-                guild_id INTEGER PRIMARY KEY,
-                channel_id INTEGER NOT NULL,
-                set_by INTEGER,
-                set_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS daily_stats_messages (
-                guild_id INTEGER NOT NULL,
-                period TEXT NOT NULL,
-                message_id INTEGER,
-                PRIMARY KEY (guild_id, period)
-            )
-        """)
-        await conn.commit()
+    await run_script(DAILY_DB_PATH, """
+        CREATE TABLE IF NOT EXISTS daily_stats_config (
+            guild_id INTEGER PRIMARY KEY,
+            channel_id INTEGER NOT NULL,
+            set_by INTEGER,
+            set_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS daily_stats_messages (
+            guild_id INTEGER NOT NULL,
+            period TEXT NOT NULL,
+            message_id INTEGER,
+            PRIMARY KEY (guild_id, period)
+        );
+    """)
 
 
 async def _set_channel(guild_id: int, channel_id: int, set_by: int):
-    """Sets/replaces the channel and clears any previously stored message
-    ids for this guild — a new channel means a new message is sent (by
-    the caller right after this), not an edit of one that may not even
-    be in the new channel."""
-    async with aiosqlite.connect(DAILY_DB_PATH) as conn:
-        await conn.execute(
-            "INSERT INTO daily_stats_config (guild_id, channel_id, set_by) VALUES (?, ?, ?) "
-            "ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, "
-            "set_by=excluded.set_by, set_at=CURRENT_TIMESTAMP",
-            (guild_id, channel_id, set_by),
-        )
-        await conn.execute("DELETE FROM daily_stats_messages WHERE guild_id = ?", (guild_id,))
-        await conn.commit()
+    await run_write(DAILY_DB_PATH,
+        "INSERT INTO daily_stats_config (guild_id, channel_id, set_by) VALUES (?, ?, ?) "
+        "ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id, "
+        "set_by=excluded.set_by, set_at=CURRENT_TIMESTAMP",
+        (guild_id, channel_id, set_by))
+    await run_write(DAILY_DB_PATH, "DELETE FROM daily_stats_messages WHERE guild_id = ?", (guild_id,))
 
 
 async def _set_message_id(guild_id: int, period: str, message_id: int):
-    async with aiosqlite.connect(DAILY_DB_PATH) as conn:
-        await conn.execute(
-            "INSERT INTO daily_stats_messages (guild_id, period, message_id) VALUES (?, ?, ?) "
-            "ON CONFLICT(guild_id, period) DO UPDATE SET message_id=excluded.message_id",
-            (guild_id, period, message_id),
-        )
-        await conn.commit()
+    await run_write(DAILY_DB_PATH,
+        "INSERT INTO daily_stats_messages (guild_id, period, message_id) VALUES (?, ?, ?) "
+        "ON CONFLICT(guild_id, period) DO UPDATE SET message_id=excluded.message_id",
+        (guild_id, period, message_id))
 
 
 async def _delete_message_rows(guild_id: int, periods: list[str]):
     if not periods:
         return
     placeholders = ",".join("?" for _ in periods)
-    async with aiosqlite.connect(DAILY_DB_PATH) as conn:
-        await conn.execute(
-            f"DELETE FROM daily_stats_messages WHERE guild_id = ? AND period IN ({placeholders})",
-            (guild_id, *periods),
-        )
-        await conn.commit()
+    await run_write(DAILY_DB_PATH,
+        f"DELETE FROM daily_stats_messages WHERE guild_id = ? AND period IN ({placeholders})",
+        (guild_id, *periods))
 
 
 async def _get_message_ids(guild_id: int) -> dict[str, int]:
-    """{period: message_id} for every stored message of this guild —
-    the "combined" report, plus any legacy per-period ids still waiting
-    to be cleaned up."""
-    async with aiosqlite.connect(DAILY_DB_PATH) as conn:
-        async with conn.execute(
-            "SELECT period, message_id FROM daily_stats_messages WHERE guild_id = ? AND message_id IS NOT NULL",
-            (guild_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-    return {period: message_id for period, message_id in rows}
+    rows = await run_query(DAILY_DB_PATH,
+        "SELECT period, message_id FROM daily_stats_messages WHERE guild_id = ? AND message_id IS NOT NULL",
+        (guild_id,))
+    return {r["period"]: r["message_id"] for r in rows}
 
 
 async def _get_all_configs() -> list[dict]:
-    async with aiosqlite.connect(DAILY_DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT * FROM daily_stats_config") as cursor:
-            rows = await cursor.fetchall()
-    return [dict(row) for row in rows]
+    return await run_query(DAILY_DB_PATH, "SELECT * FROM daily_stats_config")
 
 
 async def _get_links_by_jellyfin_ids_batch(jellyfin_user_ids: list[str]) -> dict[str, int]:
     if not jellyfin_user_ids:
         return {}
     placeholders = ",".join("?" for _ in jellyfin_user_ids)
-    async with aiosqlite.connect(LINKS_DB_PATH) as conn:
-        async with conn.execute(
-            f"SELECT jellyfin_user_id, discord_id FROM links WHERE jellyfin_user_id IN ({placeholders})",
-            jellyfin_user_ids,
-        ) as cursor:
-            rows = await cursor.fetchall()
-    return {row[0]: row[1] for row in rows}
+    rows = await run_query(LINKS_DB_PATH,
+        f"SELECT jellyfin_user_id, discord_id FROM links WHERE jellyfin_user_id IN ({placeholders})",
+        jellyfin_user_ids)
+    return {r["jellyfin_user_id"]: r["discord_id"] for r in rows}
 
 
-_bot_ref = None
-
-
-async def _get_jellyfin_session() -> aiohttp.ClientSession:
-    return _bot_ref.http_session
+_jf: JellyfinClient | None = None
 
 
 async def _fetch_all_jellyfin_users() -> list[dict]:
-    headers = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"', "accept": "application/json"}
-    session = await _get_jellyfin_session()
     try:
-        async with session.get(f"{JELLYFIN_URL}/Users", headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                return []
-            return await resp.json()
+        return await _jf.get_users()
     except Exception:
         return []
 
 
 async def _query_playback_reporting(sql: str) -> list[dict] | None:
-    headers = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"', "accept": "application/json"}
-    session = await _get_jellyfin_session()
-    try:
-        async with session.post(
-            PLAYBACK_REPORTING_QUERY_URL, headers=headers,
-            json={"CustomQueryString": sql}, timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
-            if resp.status != 200:
-                logger.error(f"[DailyStats] Playback Reporting query failed: HTTP {resp.status}")
-                return None
-            data = await resp.json()
-    except Exception as e:
-        logger.error(f"[DailyStats] Playback Reporting query failed: {type(e).__name__}: {e}")
-        return None
-
-    columns = data.get("colums") or data.get("columns") or []
-    rows = data.get("results") or []
-    return [dict(zip(columns, row)) for row in rows]
+    return await _jf.playback_query(sql)
 
 
 async def _get_ranked_totals(start_days_ago: float, end_days_ago: float = 0) -> list[tuple[str, int]]:
@@ -457,8 +391,8 @@ class DailyStats(commands.Cog):
         self.category = "Utility"
 
     async def cog_load(self):
-        global _bot_ref
-        _bot_ref = self.bot
+        global _jf
+        _jf = JellyfinClient(self.bot)
         await _ensure_db()
         self.refresh_stats.start()
 

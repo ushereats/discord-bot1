@@ -65,7 +65,6 @@ Poll Suggestions Cog
 Config: set POLL_CHANNEL_ID and OWNER_DISCORD_ID below.
 """
 
-import os
 import logging
 import asyncio
 from datetime import timedelta, datetime, timezone
@@ -74,18 +73,17 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from utils.config import OWNER_DISCORD_ID, POLL_DB_PATH as DB_PATH
+from utils.db import run_query, run_write, run_script
+
 logger = logging.getLogger("poll_cog")
 
 POLL_CHANNEL_ID = 1540678374861832213
-OWNER_DISCORD_ID = 723417665087078451
 
 MAX_SUGGESTIONS = 10
 POLL_DURATION_HOURS = 12
 POLL_ANSWER_MAX_CHARS = 55  # Discord's own cap on a single poll answer's text
 CHECK_INTERVAL_SECONDS = 60  # how often the expiry-check loop runs
-
-DB_DIR = "/home/container/ushereats/DATABASES"
-DB_PATH = os.path.join(DB_DIR, "poll.db")
 
 RESULT_MEDALS = ["🥇", "🥈", "🥉"]
 
@@ -93,41 +91,36 @@ RESULT_MEDALS = ["🥇", "🥈", "🥉"]
 # --- DATABASE ---
 
 async def _ensure_db():
-    os.makedirs(DB_DIR, exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS poll_rounds (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
-                phase TEXT NOT NULL DEFAULT 'suggesting',
-                poll_message_id INTEGER,
-                poll_expires_at TEXT,
-                created_by INTEGER NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS poll_suggestions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                round_id INTEGER NOT NULL,
-                discord_id INTEGER NOT NULL,
-                title TEXT NOT NULL,
-                year TEXT NOT NULL,
-                title_normalized TEXT NOT NULL,
-                slot_number INTEGER NOT NULL,
-                submitted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(round_id, discord_id),
-                UNIQUE(round_id, title_normalized, year),
-                UNIQUE(round_id, slot_number)
-            )
-        """)
-        # Backfill for DBs created before poll_expires_at existed.
-        try:
-            await conn.execute("ALTER TABLE poll_rounds ADD COLUMN poll_expires_at TEXT")
-        except aiosqlite.OperationalError:
-            pass
-        await conn.commit()
+    await run_script(DB_PATH, """
+        CREATE TABLE IF NOT EXISTS poll_rounds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            phase TEXT NOT NULL DEFAULT 'suggesting',
+            poll_message_id INTEGER,
+            poll_expires_at TEXT,
+            created_by INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS poll_suggestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            round_id INTEGER NOT NULL,
+            discord_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            year TEXT NOT NULL,
+            title_normalized TEXT NOT NULL,
+            slot_number INTEGER NOT NULL,
+            submitted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(round_id, discord_id),
+            UNIQUE(round_id, title_normalized, year),
+            UNIQUE(round_id, slot_number)
+        );
+    """)
+    # Backfill for DBs created before poll_expires_at existed.
+    try:
+        await run_write(DB_PATH, "ALTER TABLE poll_rounds ADD COLUMN poll_expires_at TEXT")
+    except aiosqlite.OperationalError:
+        pass
 
 
 async def _get_active_round() -> dict | None:
@@ -136,13 +129,8 @@ async def _get_active_round() -> dict | None:
     re-fetches this fresh rather than trusting anything captured at
     message-build time, so behavior is always correct regardless of
     restarts or how stale the rendered message might be."""
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute(
-            "SELECT * FROM poll_rounds WHERE phase IN ('suggesting', 'polling') ORDER BY id DESC LIMIT 1"
-        ) as cursor:
-            row = await cursor.fetchone()
-    return dict(row) if row else None
+    rows = await run_query(DB_PATH, "SELECT * FROM poll_rounds WHERE phase IN ('suggesting', 'polling') ORDER BY id DESC LIMIT 1")
+    return rows[0] if rows else None
 
 
 async def _get_polling_rounds() -> list[dict]:
@@ -150,19 +138,12 @@ async def _get_polling_rounds() -> list[dict]:
     loop. In normal operation there's only ever one (enforced by
     _get_active_round's guard), but the loop checks all of them anyway
     rather than assuming, since it queries the DB fresh every tick."""
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT * FROM poll_rounds WHERE phase = 'polling'") as cursor:
-            rows = await cursor.fetchall()
-    return [dict(r) for r in rows]
+    return await run_query(DB_PATH, "SELECT * FROM poll_rounds WHERE phase = 'polling'")
 
 
 async def _get_round(round_id: int) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT * FROM poll_rounds WHERE id = ?", (round_id,)) as cursor:
-            row = await cursor.fetchone()
-    return dict(row) if row else None
+    rows = await run_query(DB_PATH, "SELECT * FROM poll_rounds WHERE id = ?", (round_id,))
+    return rows[0] if rows else None
 
 
 async def _create_round(channel_id: int, message_id: int, created_by: int) -> int:
@@ -177,25 +158,16 @@ async def _create_round(channel_id: int, message_id: int, created_by: int) -> in
 
 async def _set_round_phase(round_id: int, phase: str, poll_message_id: int | None = None,
                             poll_expires_at: str | None = None):
-    async with aiosqlite.connect(DB_PATH) as conn:
-        if poll_message_id is not None:
-            await conn.execute(
-                "UPDATE poll_rounds SET phase = ?, poll_message_id = ?, poll_expires_at = ? WHERE id = ?",
-                (phase, poll_message_id, poll_expires_at, round_id),
-            )
-        else:
-            await conn.execute("UPDATE poll_rounds SET phase = ? WHERE id = ?", (phase, round_id))
-        await conn.commit()
+    if poll_message_id is not None:
+        await run_write(DB_PATH,
+            "UPDATE poll_rounds SET phase = ?, poll_message_id = ?, poll_expires_at = ? WHERE id = ?",
+            (phase, poll_message_id, poll_expires_at, round_id))
+    else:
+        await run_write(DB_PATH, "UPDATE poll_rounds SET phase = ? WHERE id = ?", (phase, round_id))
 
 
 async def _get_suggestions(round_id: int) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute(
-            "SELECT * FROM poll_suggestions WHERE round_id = ? ORDER BY slot_number ASC", (round_id,)
-        ) as cursor:
-            rows = await cursor.fetchall()
-    return [dict(r) for r in rows]
+    return await run_query(DB_PATH, "SELECT * FROM poll_suggestions WHERE round_id = ? ORDER BY slot_number ASC", (round_id,))
 
 
 async def _add_suggestion(round_id: int, discord_id: int, title: str, year: str) -> tuple[bool, str | None, int | None]:

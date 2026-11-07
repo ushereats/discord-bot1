@@ -96,25 +96,23 @@ import logging
 from collections import deque
 
 import aiohttp
-import aiosqlite
 import discord
 from datetime import datetime, timezone
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from utils.config import (
+    OWNER_DISCORD_ID, TARGET_GUILD_ID, JELLYFIN_URL, JELLYFIN_API_KEY,
+    LINKED_ROLE_ID, TOKEN_CHANNEL_ID, LOG_CHANNEL_ID, DB_DIR,
+    LINKS_DB_PATH as DB_PATH,
+    EMBED_DESCRIPTION_LIMIT, EMBED_FIELD_VALUE_LIMIT, EMBED_TOTAL_LIMIT,
+)
+from utils.jellyfin_api import JellyfinClient
+from utils.db import Database
+
 logger = logging.getLogger("registry_commands_cog")
 
-OWNER_DISCORD_ID = 723417665087078451
-TARGET_GUILD_ID = 1537023658323869757
-JELLYFIN_URL = "https://jellyfin.ushereats.com"
-JELLYFIN_API_KEY = "9cb945d0d38d45cb84fcc8a2e1541bd8"
-LINKED_ROLE_ID = 1537338806943092767
-TOKEN_CHANNEL_ID = 1538205460962738318
 SERVER_INVITE_URL = "https://discord.gg/D3sCdTCkNV"
-LOG_CHANNEL_ID = 1539141762600402994
-
-DB_DIR = "/home/container/ushereats/DATABASES"
-DB_PATH = os.path.join(DB_DIR, "jellyfin_links.db")
 
 TOKEN_EXPIRY_HOURS = 24
 REMIND_MIN_AGE_HOURS = 6  # a token younger than this hasn't had a real chance to be seen yet — skip it this cycle
@@ -152,10 +150,6 @@ AUTO_DELETE_ON_LEAVE = True
 AUTO_DELETE_BURST_LIMIT = 5  # auto-deletions allowed inside one window; the next one pauses auto-delete
 AUTO_DELETE_BURST_WINDOW_SECONDS = 600
 
-# --- Discord limits ---
-EMBED_DESCRIPTION_LIMIT = 4096
-EMBED_FIELD_VALUE_LIMIT = 1024
-EMBED_TOTAL_LIMIT = 6000  # title + description + field names/values + footer, across the whole embed
 EMBED_TOTAL_SAFETY_MARGIN = 64
 MIN_FIELD_BUDGET = 150  # below this a field can't hold even one line plus the "…and N more" suffix
 MESSAGE_CONTENT_LIMIT = 2000
@@ -237,58 +231,34 @@ def _build_pending_reminder_message(message_link: str, expires_ts: int | None) -
 
 
 # --- DATABASE SETUP ---
-# A single shared aiosqlite.Connection, opened once in cog_load and reused
-# for every query for the lifetime of the process. WAL journaling +
-# NORMAL synchronous are set once here so the shared connection doesn't
-# fsync-block on every write.
-_db_conn: aiosqlite.Connection | None = None
+# Persistent connection with WAL mode and serialized writes via Database.
+_db: Database | None = None
 
 
-async def _get_db() -> aiosqlite.Connection:
-    return _db_conn
+async def _get_db():
+    """Returns the underlying aiosqlite.Connection for reads. All writes
+    go through _write() which uses Database.write() for serialization."""
+    return _db._conn
 
 
 async def _open_db():
-    global _db_conn
+    global _db
     os.makedirs(DB_DIR, exist_ok=True)
-    _db_conn = await aiosqlite.connect(DB_PATH)
-    _db_conn.row_factory = aiosqlite.Row
-    await _db_conn.execute("PRAGMA journal_mode=WAL")
-    await _db_conn.execute("PRAGMA synchronous=NORMAL")
-    await _db_conn.commit()
+    _db = Database(DB_PATH)
+    await _db.open()
 
 
 async def _close_db():
-    global _db_conn
-    if _db_conn is not None:
-        await _db_conn.close()
-        _db_conn = None
-
-
-# Every write in this module goes through _write. The shared connection
-# means statements from different coroutines would otherwise interleave
-# inside one implicit transaction, so one coroutine's commit could commit
-# another's half-finished multi-statement change. Holding this lock for
-# execute(s) + commit makes each _write call atomic: all of its
-# statements land together, or (on error) none do.
-_db_write_lock = asyncio.Lock()
+    global _db
+    if _db is not None:
+        await _db.close()
+        _db = None
 
 
 async def _write(*statements: tuple[str, tuple]) -> list[int]:
     """Executes one or more (sql, params) statements as a single atomic
     commit. Returns each statement's rowcount, in order."""
-    conn = await _get_db()
-    async with _db_write_lock:
-        try:
-            counts = []
-            for sql, params in statements:
-                cur = await conn.execute(sql, params)
-                counts.append(cur.rowcount)
-            await conn.commit()
-            return counts
-        except Exception:
-            await conn.rollback()
-            raise
+    return await _db.write(*statements)
 
 
 async def _get_meta(key: str) -> str | None:
@@ -735,146 +705,54 @@ async def _get_all_pending_signups() -> list[dict]:
     return [dict(r) for r in rows]
 
 
-# --- SHARED JELLYFIN HTTP SESSION ---
-# The whole bot process shares ONE aiohttp.ClientSession, created in
-# main.py's setup_hook and attached as bot.http_session. _bot_ref is set
-# once in cog_load.
-_bot_ref = None
-
-
-async def _get_jellyfin_session() -> aiohttp.ClientSession:
-    return _bot_ref.http_session
+# --- SHARED JELLYFIN CLIENT ---
+# Module-level JellyfinClient, initialized in cog_load.
+_jf: JellyfinClient | None = None
 
 
 # --- JELLYFIN API HELPERS ---
-# Built once at import instead of on every call.
-_JF_HEADERS = {"Authorization": f'MediaBrowser Token="{JELLYFIN_API_KEY}"', "accept": "application/json"}
-_JF_TIMEOUT = aiohttp.ClientTimeout(total=10)
-
-# Short-lived /Users cache. Every lookup and duplicate-name check used to
-# download the full user list. Now they reuse one fetch for
-# JELLYFIN_USERS_CACHE_SECONDS, and every create/rename/delete made by this
-# module invalidates it immediately, so this module never reads a list that
-# misses its own changes. (A clash with a change made directly in
-# Jellyfin's UI inside that window is still rejected by Jellyfin itself.)
-_jf_users_cache: tuple[float, list[dict]] | None = None
-_jf_users_lock = asyncio.Lock()
-
+# Thin wrappers around _jf so the 100+ call sites don't change.
 
 async def _fetch_jellyfin_users() -> list[dict]:
-    """Always hits Jellyfin (used where freshness matters: Sync and
-    reconciliation). Refreshes the cache as a side effect."""
-    global _jf_users_cache
-    session = await _get_jellyfin_session()
-    async with session.get(f"{JELLYFIN_URL}/Users", headers=_JF_HEADERS, timeout=_JF_TIMEOUT) as resp:
-        resp.raise_for_status()
-        users = await resp.json()
-    _jf_users_cache = (time.monotonic(), users)
+    """Always hits Jellyfin (freshness). Refreshes the cache as a side effect."""
+    users = await _jf.get_users()
+    _jf._users_cache = users
+    _jf._users_cache_time = time.monotonic()
     return users
 
 
 async def _get_jellyfin_users_cached() -> list[dict]:
-    """Cached /Users for lookups and duplicate checks. Concurrent callers
-    on a cold cache share ONE fetch instead of each firing their own."""
-    cached = _jf_users_cache
-    if cached is not None and time.monotonic() - cached[0] < JELLYFIN_USERS_CACHE_SECONDS:
-        return cached[1]
-    async with _jf_users_lock:
-        cached = _jf_users_cache
-        if cached is not None and time.monotonic() - cached[0] < JELLYFIN_USERS_CACHE_SECONDS:
-            return cached[1]
-        return await _fetch_jellyfin_users()
+    return await _jf.get_users_cached()
 
 
 def _invalidate_jellyfin_users_cache():
-    global _jf_users_cache
-    _jf_users_cache = None
+    _jf.invalidate_users_cache()
 
 
 async def _fetch_jellyfin_user(jellyfin_user_id: str) -> dict | None:
-    try:
-        session = await _get_jellyfin_session()
-        async with session.get(f"{JELLYFIN_URL}/Users/{jellyfin_user_id}", headers=_JF_HEADERS, timeout=_JF_TIMEOUT) as resp:
-            if resp.status != 200:
-                return None
-            return await resp.json()
-    except Exception:
-        return None
+    """Returns None on ANY error."""
+    return await _jf.get_user_strict(jellyfin_user_id)
 
 
 async def _fetch_jellyfin_user_strict(jellyfin_user_id: str) -> dict | None:
-    """Returns None ONLY on a confirmed 404. Any other failure RAISES, so
-    pending-signup reconciliation can tell 'confirmed gone' apart from
-    'couldn't check'."""
-    session = await _get_jellyfin_session()
-    async with session.get(f"{JELLYFIN_URL}/Users/{jellyfin_user_id}", headers=_JF_HEADERS, timeout=_JF_TIMEOUT) as resp:
-        if resp.status == 404:
-            return None
-        resp.raise_for_status()
-        return await resp.json()
+    """Returns None ONLY on 404. Raises on other failures."""
+    return await _jf.get_user(jellyfin_user_id)
 
 
 async def _create_jellyfin_user(username: str, password: str) -> dict:
-    """POST /Users/New — creates the account and returns the new user object
-    (includes its Id). Raises on any non-2xx via raise_for_status."""
-    payload = {"Name": username, "Password": password}
-    session = await _get_jellyfin_session()
-    try:
-        async with session.post(f"{JELLYFIN_URL}/Users/New", headers=_JF_HEADERS, json=payload, timeout=_JF_TIMEOUT) as resp:
-            resp.raise_for_status()
-            return await resp.json()
-    finally:
-        _invalidate_jellyfin_users_cache()  # even on error: the account may exist despite a failed response
+    return await _jf.create_user(username, password)
 
 
 async def _set_jellyfin_password(jellyfin_user_id: str, new_password: str):
-    """POST /Users/{id}/Password — sets a NEW password directly. Safe with
-    no old password because the admin API key bypasses Jellyfin's
-    CurrentPw check. ResetPassword stays False (True would blank the
-    password instead of setting NewPw)."""
-    payload = {"CurrentPw": "", "NewPw": new_password, "ResetPassword": False}
-    session = await _get_jellyfin_session()
-    async with session.post(
-        f"{JELLYFIN_URL}/Users/{jellyfin_user_id}/Password", headers=_JF_HEADERS, json=payload, timeout=_JF_TIMEOUT
-    ) as resp:
-        resp.raise_for_status()
+    await _jf.set_password(jellyfin_user_id, new_password)
 
 
 async def _grant_full_library_access(jellyfin_user_id: str):
-    """Fetches the account's current policy, flips EnableAllFolders on, and
-    POSTs the whole policy back — the endpoint replaces the object
-    wholesale rather than patching individual fields."""
-    session = await _get_jellyfin_session()
-
-    async with session.get(f"{JELLYFIN_URL}/Users/{jellyfin_user_id}", headers=_JF_HEADERS, timeout=_JF_TIMEOUT) as resp:
-        resp.raise_for_status()
-        user = await resp.json()
-
-    policy = user.get("Policy", {})
-    policy["EnableAllFolders"] = True
-    policy["EnabledFolders"] = []
-
-    async with session.post(
-        f"{JELLYFIN_URL}/Users/{jellyfin_user_id}/Policy", headers=_JF_HEADERS, json=policy, timeout=_JF_TIMEOUT
-    ) as resp:
-        resp.raise_for_status()
+    await _jf.grant_full_library_access(jellyfin_user_id)
 
 
 async def _delete_jellyfin_user(jellyfin_user_id: str) -> str:
-    """Returns 'deleted' (a real 200/204 — this call removed the account)
-    or 'already_gone' (404 — nothing was there). Raises on any other
-    failure. Callers that report counts MUST keep these two separate —
-    collapsing them is what once reported 54 deletions when Jellyfin only
-    lost 30 accounts."""
-    session = await _get_jellyfin_session()
-    try:
-        async with session.delete(f"{JELLYFIN_URL}/Users/{jellyfin_user_id}", headers=_JF_HEADERS, timeout=_JF_TIMEOUT) as resp:
-            if resp.status == 404:
-                return "already_gone"
-            resp.raise_for_status()
-            return "deleted"
-    finally:
-        _invalidate_jellyfin_users_cache()
+    return await _jf.delete_user(jellyfin_user_id)
 
 
 def _norm_guid(value) -> str:
@@ -885,29 +763,14 @@ def _norm_guid(value) -> str:
 
 async def _get_user_devices(jellyfin_user_id: str) -> list[dict]:
     """Every device holding a login for THIS account only, most recently
-    active first. Raises on failure.
-
-    Jellyfin's ?userId= filter on /Devices does NOT mean "this user's
-    devices" — it means "devices this user is allowed to access", and
-    with the default 'Allow access from all devices' policy that is every
-    device on the server. So the result is filtered here to devices whose
-    LastUserId is this account. Anything without a LastUserId is
-    excluded (fail closed): a user must never see, or be able to sign
-    out, someone else's device."""
-    session = await _get_jellyfin_session()
-    async with session.get(
-        f"{JELLYFIN_URL}/Devices", headers=_JF_HEADERS, params={"userId": jellyfin_user_id}, timeout=_JF_TIMEOUT,
-    ) as resp:
-        resp.raise_for_status()
-        data = await resp.json()
+    active first. Extra filtering beyond JellyfinClient.get_user_devices
+    because Jellyfin's ?userId= returns devices the user is *allowed to
+    access*, not just their own."""
+    data = await _jf.get_json("/Devices", params={"userId": jellyfin_user_id})
     owner = _norm_guid(jellyfin_user_id)
     items = [d for d in (data.get("Items") or []) if d.get("Id")]
     devices = [d for d in items if owner and _norm_guid(d.get("LastUserId")) == owner]
 
-    # Signing out works by device Id, and Jellyfin logs out EVERY account
-    # signed in under that Id — so a device shared with another account
-    # (same Id, different owner) must never be signed out from here, or
-    # this user would kick the other person too. Flag those.
     other_owner_ids = {d["Id"] for d in items if _norm_guid(d.get("LastUserId")) != owner}
     for d in devices:
         d["_shared"] = d["Id"] in other_owner_ids
@@ -916,39 +779,18 @@ async def _get_user_devices(jellyfin_user_id: str) -> list[dict]:
 
 
 async def _sign_out_device(device_id: str) -> bool:
-    """DELETE /Devices?id= — removes the device and its login token, which
-    signs it out immediately. True if Jellyfin removed it (or it was
-    already gone). Raises on other failures."""
-    session = await _get_jellyfin_session()
-    async with session.delete(
-        f"{JELLYFIN_URL}/Devices", headers=_JF_HEADERS, params={"id": device_id}, timeout=_JF_TIMEOUT,
-    ) as resp:
-        if resp.status == 404:
-            return True
-        resp.raise_for_status()
+    """DELETE /Devices?id= — signs out device. True on success or 404."""
+    try:
+        await _jf.delete_device(device_id)
         return True
+    except aiohttp.ClientResponseError as e:
+        if e.status == 404:
+            return True
+        raise
 
 
 async def _rename_jellyfin_user(jellyfin_user_id: str, new_username: str):
-    """POST /Users/{id} — replaces the whole user object, same
-    fetch-modify-post pattern as the Policy update. Only Name changes;
-    everything keyed off Id (watch history, links, Playback Reporting) is
-    unaffected."""
-    session = await _get_jellyfin_session()
-
-    async with session.get(f"{JELLYFIN_URL}/Users/{jellyfin_user_id}", headers=_JF_HEADERS, timeout=_JF_TIMEOUT) as resp:
-        resp.raise_for_status()
-        user = await resp.json()
-
-    user["Name"] = new_username
-
-    try:
-        async with session.post(
-            f"{JELLYFIN_URL}/Users/{jellyfin_user_id}", headers=_JF_HEADERS, json=user, timeout=_JF_TIMEOUT
-        ) as resp:
-            resp.raise_for_status()
-    finally:
-        _invalidate_jellyfin_users_cache()
+    await _jf.rename_user(jellyfin_user_id, new_username)
 
 
 def _sql_escape(value: str) -> str:
@@ -957,11 +799,7 @@ def _sql_escape(value: str) -> str:
 
 
 async def _get_all_time_watch_seconds(jellyfin_user_id: str) -> int | None:
-    """All-time total watch seconds for one user, via Playback Reporting's
-    custom-query endpoint, with the same >24h-row sanity bound stats_cog.py
-    uses. Returns None on any query failure — 'couldn't compute', not
-    'zero watched'."""
-    session = await _get_jellyfin_session()
+    """All-time total watch seconds for one user via Playback Reporting."""
     cap = 24 * 3600
     uid = _sql_escape(jellyfin_user_id)
     sql = (
@@ -969,13 +807,10 @@ async def _get_all_time_watch_seconds(jellyfin_user_id: str) -> int | None:
         f"WHERE UserId = '{uid}' AND PlayDuration > 0 AND PlayDuration < {cap}"
     )
     try:
-        async with session.post(
-            f"{JELLYFIN_URL}/user_usage_stats/submit_custom_query", headers=_JF_HEADERS,
-            json={"CustomQueryString": sql}, timeout=_JF_TIMEOUT,
-        ) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
+        data = await _jf.post_json(
+            "/user_usage_stats/submit_custom_query",
+            json={"CustomQueryString": sql},
+        )
     except Exception:
         return None
 
@@ -3558,9 +3393,9 @@ class JellyfinRegistryCommands(commands.Cog):
         return (self.expire_tokens_loop, self.remind_pending_loop, self.pending_signup_recheck_loop, self.weekly_sync_loop)
 
     async def cog_load(self):
-        global _bot_ref
-        _bot_ref = self.bot
-        if _db_conn is None:
+        global _jf
+        _jf = JellyfinClient(self.bot)
+        if _db is None:
             await _open_db()
         await _ensure_db()
         stored_sync = await _get_meta("last_full_sync_at")
