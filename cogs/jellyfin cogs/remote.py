@@ -1099,6 +1099,7 @@ class Remote(commands.Cog):
         self._qc_tasks: set[asyncio.Task] = set()
 
     async def cog_load(self):
+        self._links_db = await Database(LINKS_DB_PATH).open()
         self._db = await Database(REMOTE_DB_PATH).open()
         await self._db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         self._shared_view = SharedPanelView()
