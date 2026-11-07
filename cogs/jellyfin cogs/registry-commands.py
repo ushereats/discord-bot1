@@ -3,7 +3,7 @@ Jellyfin Registry Commands Cog
 
 Commands:
   - /manage [Owner]: paginated admin panel. Prev/Next walk ONE flat page
-      sequence made of two sections:
+      sequence made of three sections:
         Accounts & Tokens pages (TOKENS_PER_PAGE pending tokens each):
           Link / Unlink / Register / Unregister, grant or revoke a signup
           token, toggle auto-token-on-join. Expired tokens are hidden
@@ -11,9 +11,14 @@ Commands:
           TOKEN_EXPIRY_CHECK_MINUTES).
         Left Users pages (LEFT_USERS_PER_PAGE queued rows each):
           add/remove exemptions, Preview Deletions, Delete all left users
-          now, Sync Everything. The Exempt / Unlinked / Inactive lists are
-          embed fields, each sized against Discord's 6000-character total
-          embed budget.
+          now, Sync Everything. The Exempt / Unlinked lists are embed
+          fields, each sized against Discord's 6000-character total embed
+          budget.
+        Inactive Users pages (INACTIVE_PER_PAGE users each):
+          linked users still in the server with no Jellyfin activity in
+          INACTIVE_LINKED_DAYS+ days. Preview / Delete (throttled at
+          INACTIVE_DELETE_DELAY_SECONDS between each) / Refresh. Data
+          comes from the last Sync; Refresh triggers a new one.
   - /jellyfin [Linked users]: DMs an account summary with Reset Password,
       Change Username and My Devices buttons. My Devices lists every
       device signed into their account (name, app, last active) with a
@@ -139,6 +144,8 @@ BATCH_CONCURRENCY = 5  # max simultaneous in-flight operations for batch DM/dele
 # --- /manage pagination ---
 TOKENS_PER_PAGE = 20  # pending-token rows per Accounts & Tokens page
 LEFT_USERS_PER_PAGE = 20  # queued left-user rows per Left Users page
+INACTIVE_PER_PAGE = 20  # inactive linked users per Inactive Users page
+INACTIVE_DELETE_DELAY_SECONDS = 2.0  # pause between each Jellyfin account deletion (avoid hammering the API)
 
 # --- Instant auto-delete on leave ---
 AUTO_DELETE_ON_LEAVE = True
@@ -2576,6 +2583,237 @@ class SyncButton(discord.ui.Button):
         )
 
 
+class PreviewInactiveDeleteButton(discord.ui.Button):
+    """Inactive Users pages. Shows exactly who the next Delete press WOULD
+    delete, without touching anything."""
+    def __init__(self, callback_view):
+        super().__init__(label="👁 Preview Deletions", style=discord.ButtonStyle.secondary, row=2)
+        self.callback_view = callback_view
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        cog = interaction.client.get_cog("JellyfinRegistryCommands")
+        if cog is None or not cog._last_sync_inactive_linked:
+            return await interaction.followup.send("No inactive users found — press **🔄 Refresh** to scan.", ephemeral=True)
+
+        inactive = cog._last_sync_inactive_linked
+        exempt_ids = {row["discord_id"] for row in await _get_all_exempt_users()}
+        to_delete = [u for u in inactive if u["discord_id"] not in exempt_ids]
+        skipped = len(inactive) - len(to_delete)
+
+        staleness_note = ""
+        if cog._last_sync_at is None:
+            staleness_note = "⚠️ Never synced this session — press **🔄 Refresh** first.\n"
+        elif (time.time() - cog._last_sync_at) > STALE_SYNC_WARNING_HOURS * 3600:
+            staleness_note = f"⚠️ Last synced over {STALE_SYNC_WARNING_HOURS}h ago — data may be stale.\n"
+
+        if not to_delete:
+            msg = "Nothing would be deleted right now."
+            if skipped:
+                msg += f" ({skipped} exempt user(s) would be skipped.)"
+            return await interaction.followup.send(staleness_note + msg, ephemeral=True)
+
+        header = f"{staleness_note}👁 **Preview — would delete {len(to_delete)} inactive account(s)** (skipping {skipped} exempt)"
+        footer = (
+            f"\n\n-# Inactive = no Jellyfin activity in {INACTIVE_LINKED_DAYS}+ days."
+            "\n-# Nothing was actually deleted. Press **Delete inactive users** to proceed."
+        )
+        lines = []
+        for u in to_delete:
+            last = f"<t:{int(u['last_activity_ts'])}:R>" if u.get("last_activity_ts") else "never"
+            lines.append(f"<@{u['discord_id']}> — `{u['jellyfin_username']}` — last active {last}")
+
+        inline = f"{header}:\n" + "\n".join(lines) + footer
+        if len(inline) <= MESSAGE_CONTENT_LIMIT:
+            return await interaction.followup.send(inline, ephemeral=True)
+
+        txt = "\n".join(f"{u['jellyfin_username']} (Discord {u['discord_id']}) — last active {'never' if not u.get('last_activity_ts') else datetime.fromtimestamp(u['last_activity_ts'], tz=timezone.utc).isoformat()}" for u in to_delete)
+        file = discord.File(io.BytesIO(txt.encode()), filename="inactive_preview.txt")
+        await interaction.followup.send(
+            f"{header}.\n📎 Full list attached — too long to show inline.{footer}",
+            file=file,
+            ephemeral=True,
+        )
+
+
+class DeleteInactiveUsersButton(discord.ui.Button):
+    """Inactive Users pages. Deletes every non-exempt inactive user's
+    Jellyfin account, removes their DB link and their linked role.
+
+    Deletions are THROTTLED — one at a time with a
+    INACTIVE_DELETE_DELAY_SECONDS pause between each — to avoid
+    hammering the Jellyfin API or hitting Discord rate limits on role
+    removal. Progress is reported every 5 deletions.
+
+    Exempt users are silently skipped. The dashboard is refreshed ONCE
+    at the end. The inactive list is cleared after processing, so
+    pressing Refresh is required to see the updated state."""
+    def __init__(self, callback_view):
+        super().__init__(label="Delete inactive users", style=discord.ButtonStyle.danger, row=2)
+        self.callback_view = callback_view
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        cog = interaction.client.get_cog("JellyfinRegistryCommands")
+        if cog is None or not cog._last_sync_inactive_linked:
+            return await interaction.followup.send("No inactive users found — press **🔄 Refresh** to scan.", ephemeral=True)
+
+        inactive = list(cog._last_sync_inactive_linked)  # snapshot
+        exempt_ids = {row["discord_id"] for row in await _get_all_exempt_users()}
+        to_delete = [u for u in inactive if u["discord_id"] not in exempt_ids]
+        skipped_exempt = len(inactive) - len(to_delete)
+
+        if not to_delete:
+            msg = "Nothing to delete."
+            if skipped_exempt:
+                msg += f" ({skipped_exempt} exempt user(s) skipped.)"
+            return await interaction.followup.send(msg, ephemeral=True)
+
+        progress_msg = await interaction.followup.send(
+            f"⏳ Deleting {len(to_delete)} inactive account(s)… (throttled: ~{INACTIVE_DELETE_DELAY_SECONDS}s between each)",
+            ephemeral=True,
+            wait=True,
+        )
+
+        deleted = 0
+        already_gone = 0
+        failed = 0
+
+        for i, entry in enumerate(to_delete):
+            discord_id = entry["discord_id"]
+            jf_username = entry.get("jellyfin_username", "?")
+
+            # Resolve Jellyfin user ID from the link — the inactive list
+            # only stores the username, so we need the link row.
+            link = await _get_link_by_discord_id(discord_id)
+            if link is None:
+                already_gone += 1
+                continue
+
+            jellyfin_user_id = link["jellyfin_user_id"]
+
+            result = "deleted"
+            try:
+                await _delete_jellyfin_user(jellyfin_user_id)
+            except aiohttp.ClientResponseError as e:
+                if e.status == 404:
+                    result = "already_gone"
+                else:
+                    result = "failed"
+                    logger.error(f"[DeleteInactive] Failed to delete {jf_username} ({jellyfin_user_id}): {type(e).__name__}: {e}")
+            except Exception as e:
+                result = "failed"
+                logger.error(f"[DeleteInactive] Failed to delete {jf_username} ({jellyfin_user_id}): {type(e).__name__}: {e}")
+
+            if result == "failed":
+                failed += 1
+            else:
+                # Account gone (deleted or was already gone) — clean up DB + role.
+                await _purge_account_rows(jellyfin_user_id, discord_id)
+
+                guild = interaction.client.get_guild(TARGET_GUILD_ID)
+                if guild is not None:
+                    role = guild.get_role(LINKED_ROLE_ID)
+                    member = guild.get_member(discord_id)
+                    if role and member and role in member.roles:
+                        try:
+                            await member.remove_roles(role, reason="Inactive — deleted via /manage")
+                        except (discord.Forbidden, discord.HTTPException):
+                            pass
+
+                dashboard_cog = interaction.client.get_cog("JellyfinRegistryDashboard")
+                if dashboard_cog is not None:
+                    dashboard_cog._member_cache.pop(discord_id, None)
+
+                if result == "already_gone":
+                    already_gone += 1
+                else:
+                    deleted += 1
+
+                await _log_action(
+                    interaction.client,
+                    f"💤 **Inactive account deleted** — **{jf_username}** (`{jellyfin_user_id}`) "
+                    f"<@{discord_id}> by <@{interaction.user.id}>.",
+                )
+
+            # Progress update every 5
+            if (i + 1) % 5 == 0 or (i + 1) == len(to_delete):
+                try:
+                    await progress_msg.edit(
+                        content=f"⏳ Processing… {i + 1}/{len(to_delete)} "
+                        f"(deleted {deleted}, already gone {already_gone}, failed {failed})"
+                    )
+                except discord.HTTPException:
+                    pass
+
+            # Throttle — the whole point. Don't slam Jellyfin or Discord.
+            if i < len(to_delete) - 1:
+                await asyncio.sleep(INACTIVE_DELETE_DELAY_SECONDS)
+
+        # Clear the cached list so the panel shows "press Refresh"
+        # instead of a stale list that no longer matches reality.
+        cog._last_sync_inactive_linked = []
+
+        # One dashboard refresh at the end, not per-deletion.
+        if cog is not None and (deleted or already_gone):
+            await cog._notify_dashboard(full=True)
+
+        content, embed = await self.callback_view.build_full_display()
+        await interaction.edit_original_response(content=content, embed=embed, view=self.callback_view)
+
+        summary = f"✅ Deleted {deleted} inactive account(s)."
+        if already_gone:
+            summary += f" 🧹 {already_gone} were already gone (stale tracking cleared)."
+        if skipped_exempt:
+            summary += f" 🛡️ Skipped {skipped_exempt} exempt."
+        if failed:
+            summary += f" ⚠️ {failed} failed — press **🔄 Refresh** then retry."
+        summary += "\n-# Press **🔄 Refresh** to see the updated state."
+
+        try:
+            await progress_msg.edit(content=summary)
+        except discord.HTTPException:
+            await interaction.followup.send(summary, ephemeral=True)
+
+        await _log_action(
+            interaction.client,
+            f"💤 **Batch inactive deletion** — deleted {deleted}, already gone {already_gone}, "
+            f"skipped {skipped_exempt} exempt, {failed} failed. By <@{interaction.user.id}>.",
+        )
+
+
+class InactiveSyncButton(discord.ui.Button):
+    """Inactive Users pages. Runs a full sync to refresh the inactive
+    user list. Same as SyncButton but lands on the inactive section."""
+    def __init__(self, callback_view):
+        super().__init__(label="🔄 Refresh", style=discord.ButtonStyle.primary, row=3)
+        self.callback_view = callback_view
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        cog = interaction.client.get_cog("JellyfinRegistryCommands")
+        if cog is None:
+            return await interaction.followup.send("❌ Registry cog not loaded.", ephemeral=True)
+
+        summary = await cog.run_full_sync(interaction.user.id)
+
+        content, embed = await self.callback_view.build_full_display()
+        await interaction.edit_original_response(content=content, embed=embed, view=self.callback_view)
+
+        if summary["errors"]:
+            return await interaction.followup.send(f"⚠️ Sync hit an issue: {'; '.join(summary['errors'])}", ephemeral=True)
+
+        inactive_count = len(summary["inactive_linked"])
+        await interaction.followup.send(
+            f"✅ Refreshed — found {inactive_count} inactive linked user(s) "
+            f"(no activity in {INACTIVE_LINKED_DAYS}+ days).",
+            ephemeral=True,
+        )
+
+
 class PrevPageButton(discord.ui.Button):
     def __init__(self, callback_view):
         super().__init__(label="◀ Prev", style=discord.ButtonStyle.secondary, row=4, disabled=(callback_view._flat_index() == 0))
@@ -2663,10 +2901,11 @@ class ManagePanelView(discord.ui.View):
     """The /manage admin panel. One FLAT page sequence, walked by
     Prev/Next:
 
-        [Accounts & Tokens 1..T] [Left Users 1..L]
+        [Accounts & Tokens 1..T] [Left Users 1..L] [Inactive Users 1..I]
 
     T = ceil(visible tokens / TOKENS_PER_PAGE), L = ceil(queued left
-    users / LEFT_USERS_PER_PAGE), each at least 1. Every page in a
+    users / LEFT_USERS_PER_PAGE), I = ceil(inactive linked users /
+    INACTIVE_PER_PAGE), each at least 1. Every page in a
     section shows that section's action components, so Grant/Revoke/
     Auto-toggle work from any token page and the delete/sync tools from
     any left-users page. The position is (section, sub_page); counts are
@@ -2685,15 +2924,17 @@ class ManagePanelView(discord.ui.View):
         super().__init__(timeout=300.0)
         self.bot = bot
         self.guild_id = guild_id
-        self.section = "tokens"  # "tokens" | "left"
+        self.section = "tokens"  # "tokens" | "left" | "inactive"
         self.sub_page = 0
         self.token_pages = 1
         self.left_pages = 1
+        self.inactive_pages = 1
         self.account_stage = "main"
         self.auto_enabled = False  # placeholder until refresh_items() runs
         self.token_count = 0
         self.expired_hidden = 0
         self.left_count = 0
+        self.inactive_count = 0
         self.message: discord.WebhookMessage | None = None  # set by /manage so on_timeout can edit it
 
     async def refresh_items(self):
@@ -2704,29 +2945,45 @@ class ManagePanelView(discord.ui.View):
         self._build_items()
 
     async def _refresh_page_counts(self):
-        """Two COUNT queries — no row data loaded. Cached on the view so the
-        embed builders don't count again."""
+        """COUNT queries + inactive list length — no row data loaded.
+        Cached on the view so the embed builders don't count again."""
         self.token_count, self.expired_hidden = await _count_tokens()
         self.left_count = await _count_left_users()
+        cog = self.bot.get_cog("JellyfinRegistryCommands") if self.bot is not None else None
+        self.inactive_count = len(cog._last_sync_inactive_linked) if (cog and cog._last_sync_inactive_linked) else 0
         self.token_pages = max(1, math.ceil(self.token_count / TOKENS_PER_PAGE))
         self.left_pages = max(1, math.ceil(self.left_count / LEFT_USERS_PER_PAGE))
-        section_pages = self.token_pages if self.section == "tokens" else self.left_pages
+        self.inactive_pages = max(1, math.ceil(self.inactive_count / INACTIVE_PER_PAGE)) if self.inactive_count else 1
+        if self.section == "tokens":
+            section_pages = self.token_pages
+        elif self.section == "left":
+            section_pages = self.left_pages
+        else:
+            section_pages = self.inactive_pages
         self.sub_page = max(0, min(self.sub_page, section_pages - 1))
 
     def _flat_index(self) -> int:
-        return self.sub_page if self.section == "tokens" else self.token_pages + self.sub_page
+        if self.section == "tokens":
+            return self.sub_page
+        elif self.section == "left":
+            return self.token_pages + self.sub_page
+        else:  # inactive
+            return self.token_pages + self.left_pages + self.sub_page
 
     def _total_pages(self) -> int:
-        return self.token_pages + self.left_pages
+        return self.token_pages + self.left_pages + self.inactive_pages
 
     def step(self, delta: int):
         position = max(0, min(self._total_pages() - 1, self._flat_index() + delta))
         if position < self.token_pages:
             self.section = "tokens"
             self.sub_page = position
-        else:
+        elif position < self.token_pages + self.left_pages:
             self.section = "left"
             self.sub_page = position - self.token_pages
+        else:
+            self.section = "inactive"
+            self.sub_page = position - self.token_pages - self.left_pages
 
     def _build_items(self):
         self.clear_items()
@@ -2752,12 +3009,16 @@ class ManagePanelView(discord.ui.View):
                 self.add_item(UnregisterUserSelect(self))
                 self.add_item(UnregisterByUsernameButton(self))
                 self.add_item(_AccountBackButton(self))
-        else:
+        elif self.section == "left":
             self.add_item(AddExemptionSelect(self))
             self.add_item(RemoveExemptionSelect(self))
             self.add_item(PreviewDeleteButton(self))
             self.add_item(DeleteLeftUsersButton(self))
             self.add_item(SyncButton(self))
+        else:  # inactive
+            self.add_item(PreviewInactiveDeleteButton(self))
+            self.add_item(DeleteInactiveUsersButton(self))
+            self.add_item(InactiveSyncButton(self))
         self.add_item(PrevPageButton(self))
         self.add_item(NextPageButton(self))
 
@@ -2771,8 +3032,10 @@ class ManagePanelView(discord.ui.View):
                 embed = await self._build_page_accounts_tokens_embed()
             else:
                 embed = self._build_page_accounts_embed()
-        else:
+        elif self.section == "left":
             embed = await self._build_page_leftusers_embed()
+        else:  # inactive
+            embed = self._build_page_inactive_embed()
         return None, embed
 
     def _build_page_accounts_embed(self) -> discord.Embed:
@@ -2898,15 +3161,48 @@ class ManagePanelView(discord.ui.View):
         else:
             specs.append(("🔎 Unlinked Jellyfin Accounts", [], "Press **Sync Everything** to check."))
 
-        if cog is not None and cog._last_sync_inactive_linked:
-            inactive = cog._last_sync_inactive_linked
-            inactive_lines = []
-            for entry in inactive:
-                last_seen = f"<t:{int(entry['last_activity_ts'])}:R>" if entry.get("last_activity_ts") else "never"
-                inactive_lines.append(f"<@{entry['discord_id']}> — `{entry['jellyfin_username']}` — last active {last_seen}")
-            specs.append((f"💤 Inactive Linked Users ({len(inactive)}, {INACTIVE_LINKED_DAYS}+ days)", inactive_lines, None))
-
         _add_budgeted_fields(embed, specs)
+        return embed
+
+    def _build_page_inactive_embed(self) -> discord.Embed:
+        """Inactive Users section — paginated list of linked users with
+        no Jellyfin activity in INACTIVE_LINKED_DAYS+ days. Data comes
+        from the last Sync; press Refresh to re-scan."""
+        cog = self.bot.get_cog("JellyfinRegistryCommands") if self.bot is not None else None
+        inactive = cog._last_sync_inactive_linked if (cog and cog._last_sync_inactive_linked) else []
+
+        sync_line = ""
+        if cog is not None and cog._last_sync_at is not None:
+            age_seconds = time.time() - cog._last_sync_at
+            sync_line = f"🔄 Last synced <t:{int(cog._last_sync_at)}:R>"
+            if age_seconds > STALE_SYNC_WARNING_HOURS * 3600:
+                sync_line += f" — ⚠️ over {STALE_SYNC_WARNING_HOURS}h ago, press **🔄 Refresh** before deleting."
+        else:
+            sync_line = "🔄 Never synced this session — press **🔄 Refresh** to populate this list."
+
+        before = f"{sync_line}\n-# Inactive = no Jellyfin activity in {INACTIVE_LINKED_DAYS}+ days. Still in the server.\n\n"
+
+        if not inactive:
+            list_text = "No inactive users found. Press **🔄 Refresh** to scan."
+        else:
+            start = self.sub_page * INACTIVE_PER_PAGE
+            page_items = inactive[start:start + INACTIVE_PER_PAGE]
+            before += f"**Inactive users {start + 1}–{start + len(page_items)} of {len(inactive)}**\n"
+            lines = []
+            for entry in page_items:
+                last_seen = f"<t:{int(entry['last_activity_ts'])}:R>" if entry.get("last_activity_ts") else "never"
+                lines.append(f"<@{entry['discord_id']}> — `{entry['jellyfin_username']}` — last active {last_seen}")
+            list_text = _join_lines_within_limit(lines, len(lines), limit=EMBED_DESCRIPTION_LIMIT - len(before))
+
+        embed = discord.Embed(
+            title=f"💤 Inactive Users — Page {self._flat_index() + 1}/{self._total_pages()}",
+            description=before + list_text,
+            color=discord.Color.dark_grey(),
+        )
+        embed.set_footer(text=(
+            "Preview shows exactly who would be deleted. Delete removes their Jellyfin account, "
+            "DB link, and linked role — throttled to avoid rate limits. Exempt users are always skipped."
+        ))
         return embed
 
     async def on_timeout(self):
