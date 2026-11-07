@@ -200,15 +200,19 @@ class JellyfinClient:
 
     # --- Playback Reporting (custom query) ---
 
-    async def playback_query(self, sql: str, *, timeout: aiohttp.ClientTimeout | None = None) -> list[list]:
+    async def playback_query(self, sql: str, *, timeout: aiohttp.ClientTimeout | None = None) -> list[dict]:
         """POST to the Playback Reporting plugin's custom query endpoint.
-        Returns the result rows."""
+        Returns the result rows as dicts keyed by column name."""
         data = await self.post_json(
             "/user_usage_stats/submit_custom_query",
             json={"CustomQueryString": sql, "ReplaceUserId": False},
             timeout=timeout,
         )
-        return data.get("results", [])
+        # Jellyfin Playback Reporting uses the typo "colums" (no 'n')
+        raw_cols = data.get("colums") or data.get("columns") or []
+        columns = [col.get("Name", f"col{i}") if isinstance(col, dict) else str(col)
+                    for i, col in enumerate(raw_cols)]
+        return [dict(zip(columns, row)) for row in data.get("results", [])]
 
     # --- Items / Images ---
 

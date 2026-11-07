@@ -1139,9 +1139,8 @@ class Remote(commands.Cog):
             value, at = cached
             if now - at < (LINK_CACHE_SECONDS if value else LINK_MISS_CACHE_SECONDS):
                 return value
-        async with self._links_db.execute("SELECT jellyfin_user_id FROM links WHERE discord_id = ?", (discord_id,)) as cursor:
-            row = await cursor.fetchone()
-        value = row[0] if row else None
+        row = await self._links_db.fetch_one("SELECT jellyfin_user_id FROM links WHERE discord_id = ?", (discord_id,))
+        value = row["jellyfin_user_id"] if row else None
         self._link_cache[discord_id] = (value, now)
         return value
 
@@ -1440,13 +1439,11 @@ class Remote(commands.Cog):
         return False
 
     async def _meta_get(self, key: str) -> str | None:
-        async with self._db.execute("SELECT value FROM meta WHERE key = ?", (key,)) as cursor:
-            row = await cursor.fetchone()
-        return row[0] if row else None
+        row = await self._db.fetch_one("SELECT value FROM meta WHERE key = ?", (key,))
+        return row["value"] if row else None
 
     async def _meta_set(self, key: str, value: str):
-        await self._db.execute("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
-        await self._db.commit()
+        await self._db.write(("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value)))
 
     # --- shared panel upkeep ---
     # One rule: the remote channel always has exactly ONE panel message from
@@ -1511,12 +1508,12 @@ class Remote(commands.Cog):
         Every panel's message ID is saved per channel, so delete any saved
         panel that isn't in the current channel."""
         try:
-            async with self._db.execute("SELECT key, value FROM meta WHERE key LIKE 'panel:%'") as cursor:
-                rows = await cursor.fetchall()
+            rows = await self._db.fetch_all("SELECT key, value FROM meta WHERE key LIKE 'panel:%'")
         except Exception as e:
             logger.warning(f"[Remote] Couldn't read saved panels: {type(e).__name__}: {e}")
             return
-        for key, value in rows:
+        for row in rows:
+            key, value = row["key"], row["value"]
             channel_id = int(key.split(":", 1)[1])
             if channel_id == current_channel_id:
                 continue
@@ -1527,8 +1524,7 @@ class Remote(commands.Cog):
                     logger.info(f"[Remote] Removed the old panel from #{old_channel.name}.")
                 except discord.HTTPException:
                     pass
-            await self._db.execute("DELETE FROM meta WHERE key = ?", (key,))
-        await self._db.commit()
+            await self._db.write(("DELETE FROM meta WHERE key = ?", (key,)))
 
     async def _panel_loop(self):
         await self.bot.wait_until_ready()
