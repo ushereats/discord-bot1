@@ -73,8 +73,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from .utils.config import OWNER_DISCORD_ID, POLL_DB_PATH as DB_PATH
-from .utils.db import run_query, run_write, run_script
+from .utils.config import OWNER_DISCORD_ID, POLL_DB_PATH as DB_PATH, SETTINGS_DB_PATH
+from .utils.db import run_query, run_write, run_script, Database
 
 logger = logging.getLogger("poll_cog")
 
@@ -216,6 +216,42 @@ async def _add_suggestion(round_id: int, discord_id: int, title: str, year: str)
             return False, "That conflicted with another submission — please try again.", None
 
     return True, None, slot
+
+
+# --- POLL DM HELPERS ---
+
+async def _get_poll_ping_subscribers() -> list[int]:
+    """Return discord_ids of all users who have poll_pings enabled."""
+    db = Database(SETTINGS_DB_PATH)
+    rows = await db.fetch_all(
+        "SELECT discord_id FROM user_settings WHERE poll_pings = 1"
+    )
+    return [r["discord_id"] for r in rows]
+
+
+async def _dm_poll_subscribers(bot: commands.Bot, message: str):
+    """DM all users with poll_pings=1. Uses settings cog's _broadcast_dm
+    if available, otherwise sends directly."""
+    recipients = await _get_poll_ping_subscribers()
+    if not recipients:
+        return
+    settings_cog = bot.get_cog("UserSettings")
+    if settings_cog:
+        # Use the existing rate-limited broadcast from settings.py
+        from .settings import _broadcast_dm
+        sent = await _broadcast_dm(bot, recipients, message)
+        logger.info(f"[PollSuggestions] DM sent to {sent}/{len(recipients)} poll subscribers.")
+    else:
+        # Fallback: send directly
+        sent = 0
+        for uid in recipients:
+            try:
+                user = bot.get_user(uid) or await bot.fetch_user(uid)
+                await user.send(message)
+                sent += 1
+            except discord.HTTPException:
+                pass
+        logger.info(f"[PollSuggestions] DM sent to {sent}/{len(recipients)} poll subscribers (fallback).")
 
 
 # --- COMPONENTS V2 BUILDERS ---
@@ -506,6 +542,12 @@ class PollSuggestions(commands.Cog):
         await _set_round_phase(round_row["id"], "polling", poll_message_id=poll_msg.id,
                                 poll_expires_at=expires_at_iso)
 
+        # DM poll subscribers that voting is open
+        asyncio.create_task(_dm_poll_subscribers(
+            self.bot,
+            f"🗳️ **Suggestions are closed — time to vote!**\nHead to <#{POLL_CHANNEL_ID}> and cast your vote. Poll runs for {POLL_DURATION_HOURS}h."
+        ))
+
         if interaction:
             await interaction.followup.send(
                 f"✅ Poll started with {len(suggestions)} option(s) — runs for {POLL_DURATION_HOURS}h.", ephemeral=True
@@ -657,6 +699,12 @@ class PollSuggestions(commands.Cog):
             await ping_msg.delete(delay=5)  # auto-delete after 5s — the ping is delivered, no need to keep it
         except discord.HTTPException:
             pass  # non-critical
+
+        # DM poll subscribers that suggestions are open
+        asyncio.create_task(_dm_poll_subscribers(
+            self.bot,
+            f"🎬 **Suggestions are now open!**\nHead to <#{POLL_CHANNEL_ID}> and submit your pick before the poll starts."
+        ))
 
         await interaction.followup.send(f"✅ Suggestion round started in {channel.mention}.", ephemeral=True)
         logger.info(f"[PollSuggestions] New suggestion round {round_id} started by <@{interaction.user.id}>.")
