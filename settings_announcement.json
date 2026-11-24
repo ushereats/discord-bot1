@@ -1,0 +1,36 @@
+{
+  "flags": 32768,
+  "components": [
+    {
+      "type": 17,
+      "components": [
+        {
+          "type": 10,
+          "content": "## ⚙️ New: Notification Settings"
+        },
+        {
+          "type": 10,
+          "content": "@everyone — `/jellyfin` now has a second page for notification settings. Tap ▶️ to get to it.\n\nToggles for playback, new episodes, server status, security, maintenance, and your weekly watch digest."
+        },
+        {
+          "type": 14,
+          "spacing": 2,
+          "divider": true
+        },
+        {
+          "type": 10,
+          "content": "🗳️ **Poll Pings** — turn it on and you'll get pinged when a suggestion round opens so you can submit picks and vote."
+        },
+        {
+          "type": 14,
+          "spacing": 2,
+          "divider": true
+        },
+        {
+          "type": 10,
+          "content": "-# `/jellyfin` → page 2 → tap 🗳️ to enable."
+        }
+      ]
+    }
+  ]
+}
