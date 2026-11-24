@@ -223,10 +223,14 @@ async def _add_suggestion(round_id: int, discord_id: int, title: str, year: str)
 async def _get_poll_ping_subscribers() -> list[int]:
     """Return discord_ids of all users who have poll_pings enabled."""
     db = Database(SETTINGS_DB_PATH)
-    rows = await db.fetch_all(
-        "SELECT discord_id FROM user_settings WHERE poll_pings = 1"
-    )
-    return [r["discord_id"] for r in rows]
+    await db.open()
+    try:
+        rows = await db.fetch_all(
+            "SELECT discord_id FROM user_settings WHERE poll_pings = 1"
+        )
+        return [r["discord_id"] for r in rows]
+    finally:
+        await db.close()
 
 
 async def _dm_poll_subscribers(bot: commands.Bot, message: str):
@@ -695,8 +699,7 @@ class PollSuggestions(commands.Cog):
 
         # Ping the poll role so subscribers know a new round opened
         try:
-            ping_msg = await channel.send(f"<@&{POLL_PING_ROLE_ID}> New suggestion round is open! Use the button above to submit your picks.")
-            await ping_msg.delete(delay=5)  # auto-delete after 5s — the ping is delivered, no need to keep it
+            await channel.send(f"<@&{POLL_PING_ROLE_ID}> New suggestion round is open! Use the button above to submit your picks.")
         except discord.HTTPException:
             pass  # non-critical
 
