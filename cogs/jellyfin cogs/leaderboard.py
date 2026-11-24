@@ -173,7 +173,8 @@ async def _get_ranked_totals(start_days_ago: float, end_days_ago: float = 0) -> 
         window_clause = f"DateCreated >= '{start_cutoff}'"
 
     sql = (
-        "SELECT UserId, SUM(PlayDuration) AS total FROM PlaybackActivity "
+        "SELECT UserId, SUM(CASE WHEN PlayDuration - COALESCE(PauseDuration, 0) > 0 THEN PlayDuration - COALESCE(PauseDuration, 0) ELSE 0 END) AS total "
+        "FROM PlaybackActivity "
         f"WHERE {window_clause} AND PlayDuration > 0 AND PlayDuration < {cap} "
         "AND UserId IS NOT NULL AND UserId != '' "
         "GROUP BY UserId ORDER BY total DESC"
@@ -190,7 +191,7 @@ async def _get_most_watched(start_days_ago: float) -> tuple[str | None, int]:
     sql = (
         "SELECT CASE WHEN ItemType='Episode' AND ItemName LIKE '% - s%' "
         "THEN SUBSTR(ItemName, 1, INSTR(ItemName, ' - s') - 1) ELSE ItemName END AS display_name, "
-        "SUM(PlayDuration) AS total "
+        "SUM(CASE WHEN PlayDuration - COALESCE(PauseDuration, 0) > 0 THEN PlayDuration - COALESCE(PauseDuration, 0) ELSE 0 END) AS total "
         f"FROM PlaybackActivity WHERE DateCreated >= '{cutoff}' "
         f"AND PlayDuration > 0 AND PlayDuration < {cap} "
         "GROUP BY display_name ORDER BY total DESC LIMIT 1"

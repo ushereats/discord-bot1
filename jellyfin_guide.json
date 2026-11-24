@@ -1,0 +1,61 @@
+{
+  "components": [
+    {
+      "type": 17,
+      "components": [
+        {
+          "type": 10,
+          "content": "# Jellyfin Server Guide"
+        },
+        {
+          "type": 14
+        },
+        {
+          "type": 10,
+          "content": "Welcome! This server runs **Jellyfin** — a free media streaming platform. Here's how to get set up."
+        },
+        {
+          "type": 14
+        },
+        {
+          "type": 10,
+          "content": "### Step 1 — Sign Up\nHead to the **token channel** and grab your invite. If you haven't signed up yet, do that first — you won't be able to log in without an account."
+        },
+        {
+          "type": 14
+        },
+        {
+          "type": 10,
+          "content": "### Step 2 — Pick an App\n**iPhone / iPad** — [Moonfin](https://apps.apple.com/app/moonfin/id6741721554) *(best option)*\n**Android / Android TV** — [Findroid](https://play.google.com/store/apps/details?id=dev.jdtech.jellyfin) or official Jellyfin app\n**Windows / Mac** — [Jellyfin Media Player](https://github.com/jellyfin/jellyfin-media-player/releases) or the web browser\n**Fire TV / Roku / Smart TV** — Official Jellyfin app or the TV's built-in browser"
+        }
+      ],
+      "accent_color": 5793266,
+      "spoiler": false
+    },
+    {
+      "type": 17,
+      "components": [
+        {
+          "type": 10,
+          "content": "### Step 3 — Connect to the Server\nWhen the app asks for a server address, enter:\n```\nhttps://jf.chromaah.net\n```"
+        },
+        {
+          "type": 14
+        },
+        {
+          "type": 10,
+          "content": "### Step 4 — Log In\n**Quick Connect** *(easiest)* — Open the app, select Quick Connect, and you'll get a code. Open Jelly Remote or the Jellyfin web dashboard, go to your profile, and enter that code.\n\n**Username & Password** — Just type in the credentials you created when you signed up."
+        },
+        {
+          "type": 14
+        },
+        {
+          "type": 10,
+          "content": "That's it — you're in. If something isn't working, ask in the support channel."
+        }
+      ],
+      "accent_color": 5793266,
+      "spoiler": false
+    }
+  ]
+}

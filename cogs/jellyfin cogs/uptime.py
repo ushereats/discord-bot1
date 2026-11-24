@@ -259,6 +259,13 @@ class JellyfinUptime(commands.Cog):
             f"[JellyfinUptime] DOWN confirmed ({reason}) — flap_count={state['incident_flap_count']}, "
             f"down_message={state['incident_down_message_id']}."
         )
+        # Forward to settings cog for instant server_status DMs
+        settings_cog = self.bot.get_cog("UserSettings")
+        if settings_cog is not None:
+            try:
+                await settings_cog.handle_server_status(is_down=True, reason=reason)
+            except Exception as e:
+                logger.error(f"[JellyfinUptime] Settings status handler error: {e}", exc_info=True)
 
     async def _handle_up_transition(self, state: dict, now: float):
         down_since = state.get("down_since")
@@ -280,6 +287,13 @@ class JellyfinUptime(commands.Cog):
             f"incident total {_format_duration(state['incident_total_downtime_seconds'])}, "
             f"flap_count={state.get('incident_flap_count', 1)}."
         )
+        # Forward to settings cog for instant server_status DMs
+        settings_cog = self.bot.get_cog("UserSettings")
+        if settings_cog is not None:
+            try:
+                await settings_cog.handle_server_status(is_down=False)
+            except Exception as e:
+                logger.error(f"[JellyfinUptime] Settings status handler error: {e}", exc_info=True)
 
     def _maybe_close_incident(self, state: dict, now: float):
         last_transition = state.get("incident_last_transition_at")

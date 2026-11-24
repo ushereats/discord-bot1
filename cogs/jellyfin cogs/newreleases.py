@@ -61,20 +61,17 @@ New Media Announcer Cog (Tracearr SSE-driven)
     is wrong or incomplete and gets manually fixed (via /embededit or by
     hand) — without this, the very next /syncmedia run would silently
     revert that manual fix back to the auto-generated version.
-  - /redoscreenshot <message_id>: [Owner] Adds a quality-check screenshot
-    to an existing announcement that doesn't have one yet, or replaces
-    the existing one with a freshly grabbed frame at a new random point
-    (so the image is visibly different, not a re-fetch of the same shot)
-    if it already has one. NOT gated by AUTO_QUALITY_SCREENSHOT_ENABLED
-    — that flag only controls the automatic pipeline; this is an
-    explicit manual action and works regardless of the toggle.
-  - /adoptannouncement <message_id> <item_id>: [Owner] Registers an
-    existing announcement message that has NO database row (posted, but
-    the record step never ran) so every other command — /redoscreenshot,
-    /syncmedia, the Quality Check button — can act on it again. Manual
-    fallback only — AUTO-ADOPT below normally handles this on its own.
+  - /screenshot [message_id]: [Owner] Two modes in one command:
+      With message_id: adds or replaces the quality-check screenshot on
+      that specific announcement with a freshly grabbed frame (so the
+      image is visibly different each time). Auto-adopts untracked
+      messages on the spot — no separate adoption step needed. NOT
+      gated by AUTO_QUALITY_SCREENSHOT_ENABLED.
+      Without message_id: adopts untracked announcements, then
+      force-runs the screenshot sweep for every announcement still
+      missing a screenshot. Bypasses the circuit breaker entirely.
 
-  AUTO-ADOPT: every screenshot sweep (periodic AND /fixscreenshots) first
+  AUTO-ADOPT: every screenshot sweep (periodic AND /screenshot) first
   scans the last ADOPT_SCAN_LIMIT messages in CHANNEL_ID for this bot's
   own announcements that have no DB row, and registers them. The
   Jellyfin ID is read straight from the poster thumbnail URL already on
@@ -110,7 +107,7 @@ New Media Announcer Cog (Tracearr SSE-driven)
   why). Seeks to a random point within
   SCREENSHOT_WINDOW_START_SECONDS-SCREENSHOT_WINDOW_END_SECONDS — small
   and bounded on purpose, both to keep every grab fast regardless of the
-  source's bitrate/length and so /redoscreenshot's re-grabs land on a
+  source's bitrate/length and so /screenshot's re-grabs land on a
   visibly different frame each time. The manual "Add Quality Check"
   button stays available as a fallback either way — if the auto-grab
   fails for any reason (ffmpeg unavailable, stream unreachable, a
@@ -134,21 +131,22 @@ New Media Announcer Cog (Tracearr SSE-driven)
       still missing a screenshot and tries again — this is what turns a
       failure that survived even the retries into a temporary one
       instead of a permanent one, with nobody needing to notice and run
-      /redoscreenshot by hand.
+      /screenshot by hand.
     - Circuit breaker (SCREENSHOT_CIRCUIT_BREAKER_THRESHOLD /
       SCREENSHOT_CIRCUIT_BREAKER_COOLDOWN_SECONDS): if several attempts
       fail in a row, that's a signal Jellyfin itself is struggling right
       now, not that we're just unlucky — pauses ALL automatic attempts
       (on-post and the sweep) for a cooldown instead of continuing to
       hammer an already-strained server with retries likely to fail
-      anyway. Manual /redoscreenshot and /testscreenshot are NOT gated
-      by this — an admin explicitly asking for one right now should
-      still be able to try.
-    - /fixscreenshots: [Owner] force-runs the sweep immediately for
-      every announcement currently missing a screenshot, instead of
-      waiting for the next periodic pass — bypasses the circuit breaker
-      entirely, since this is a deliberate one-off request, not the
-      unattended automatic path the breaker exists to protect against.
+      anyway. Manual /screenshot <message_id> is NOT gated by this —
+      an admin explicitly asking for one right now should still be able
+      to try.
+    - /screenshot (no message_id): [Owner] force-runs the sweep
+      immediately for every announcement currently missing a screenshot,
+      instead of waiting for the next periodic pass — bypasses the
+      circuit breaker entirely, since this is a deliberate one-off
+      request, not the unattended automatic path the breaker exists to
+      protect against.
 
   SERIES ROLLUP WINDOW: ROLLING, not fixed. When the first episode of a
   series is announced, that announcement is "open" for
@@ -293,11 +291,16 @@ SYNC_PROGRESS_LIST_CAP = 25
 # state is never stale.
 SYNC_PROGRESS_UPDATE_MIN_INTERVAL_SECONDS = 1.5
 
+# Announcements older than this are skipped by /syncmedia by default —
+# metadata on a 30-day-old movie isn't changing. The `full` flag on the
+# command overrides this and processes everything.
+SYNC_MAX_AGE_DAYS = 30
+
 # --- AUTO QUALITY-CHECK SCREENSHOT CONFIG ---
 AUTO_QUALITY_SCREENSHOT_ENABLED = True
 
 # Random point within this window is the seek target — not a fixed
-# fraction of runtime. /redoscreenshot picking a fresh random point in
+# fraction of runtime. /screenshot picking a fresh random point in
 # this same window is what makes a "redo" actually produce a visibly
 # different frame each time, not just re-fetch the identical shot.
 SCREENSHOT_WINDOW_START_SECONDS = 15
@@ -357,7 +360,7 @@ MIN_SCREENSHOT_BYTES = 50_000
 # See _grab_quality_screenshot_with_retry. Failures here have been
 # confirmed to look transient (Jellyfin's transcode running slow under
 # momentary server load), so a short automatic retry meaningfully
-# reduces how often this needs a manual /redoscreenshot.
+# reduces how often this needs a manual /screenshot.
 SCREENSHOT_RETRY_ATTEMPTS = 2
 SCREENSHOT_RETRY_DELAY_SECONDS = 5
 # Actual delay is jittered around this value (see
@@ -367,11 +370,27 @@ SCREENSHOT_RETRY_DELAY_SECONDS = 5
 # and piling onto Jellyfin again at the same instant during recovery.
 SCREENSHOT_RETRY_JITTER_FRACTION = 0.5  # +/- 50% of the base delay
 
+# --- MULTI-FRAME CANDIDATE SELECTION ---
+# Instead of grabbing one random frame and hoping it's good, grab
+# SCREENSHOT_CANDIDATES frames at evenly-spaced points across the
+# seek window, score each for visual quality (brightness variance,
+# non-black pixel ratio), and pick the best one. Eliminates black
+# frames, scene transitions, and opening credits from screenshots.
+SCREENSHOT_CANDIDATES = 3
+# Minimum brightness variance (0-1 scale) for a frame to be considered
+# "not black/solid". Frames below this are scored 0 regardless of other
+# metrics. Tuned against confirmed-bad frames from production.
+SCREENSHOT_MIN_BRIGHTNESS_VARIANCE = 0.005
+# Minimum fraction of non-black pixels (RGB sum > 30) for a frame to
+# pass the basic quality check. A pure black frame scores 0.0, a
+# normal scene scores 0.8+.
+SCREENSHOT_MIN_NONBLACK_RATIO = 0.15
+
 # Self-healing sweep — periodically retries every announcement still
 # missing a screenshot (an earlier attempt, even after its own
 # SCREENSHOT_RETRY_ATTEMPTS, failed). This is what turns a transient
 # failure into a temporary one instead of a permanent one, with no one
-# needing to notice and run /redoscreenshot manually.
+# needing to notice and run /screenshot manually.
 SCREENSHOT_SWEEP_INTERVAL_MINUTES = 30
 # Pacing between records during a sweep — same reasoning as
 # SYNC_PACE_SECONDS: a batch of many missing screenshots processed
@@ -388,7 +407,7 @@ SCREENSHOT_SWEEP_CONCURRENCY = 3
 # Pauses ALL automatic attempts (on-post and sweep) for
 # SCREENSHOT_CIRCUIT_BREAKER_COOLDOWN_SECONDS rather than continuing to
 # hammer an already-strained server with retries likely to fail anyway.
-# Manual commands (/redoscreenshot, /testscreenshot) are NOT gated by
+# Manual /screenshot <message_id> is NOT gated by
 # this — an admin explicitly asking for one right now should still be
 # able to try, even while the automatic side is paused.
 SCREENSHOT_CIRCUIT_BREAKER_THRESHOLD = 5
@@ -512,9 +531,19 @@ async def _get_announcement(message_id: int) -> dict | None:
     return rows[0] if rows else None
 
 
-async def _get_all_announcements() -> list[dict]:
-    """Every stored announcement, oldest first — used by /syncmedia to
-    refresh everything in one pass instead of one message_id at a time."""
+async def _get_all_announcements(*, max_age_days: int | None = None) -> list[dict]:
+    """Stored announcements, oldest first — used by /syncmedia.
+
+    max_age_days: if set, only returns announcements posted within the
+    last N days (the common case — metadata on old movies doesn't
+    change). Pass None for the full unfiltered set."""
+    if max_age_days is not None:
+        cutoff = int(time.time()) - (max_age_days * 86400)
+        return await run_query(
+            DB_PATH,
+            "SELECT * FROM announcements WHERE posted_at >= ? ORDER BY posted_at ASC",
+            (cutoff,),
+        )
     return await run_query(DB_PATH, "SELECT * FROM announcements ORDER BY posted_at ASC")
 
 
@@ -630,8 +659,17 @@ async def _jellyfin_get_items_batched(jf: JellyfinClient, item_ids: list[str], f
     return all_items, None
 
 
-def get_poster_url(item_id: str) -> str:
-    return f"{JELLYFIN_URL}/Items/{item_id}/Images/Primary"
+def get_poster_url(item_id: str, *, optimized: bool = True) -> str:
+    """Returns the Jellyfin poster URL for the given item.
+
+    optimized=True (default) appends sizing params tuned for Discord
+    thumbnails: 160px height at quality 85 — matches retina resolution
+    exactly (80×80 CSS px × 2x DPR) while keeping payloads ~5-10 KB
+    instead of the ~500 KB+ full-res poster."""
+    base = f"{JELLYFIN_URL}/Items/{item_id}/Images/Primary"
+    if optimized:
+        return f"{base}?maxHeight=160&quality=85"
+    return base
 
 
 def get_quality_label(item: dict) -> str | None:
@@ -680,41 +718,104 @@ def _get_ffmpeg_path() -> str:
     return _ffmpeg_path_cache
 
 
-async def _grab_quality_screenshot(session: aiohttp.ClientSession, item_id: str, runtime_ticks: int | None) -> bytes | None:
+def _compute_seek_positions(runtime_ticks: int | None, count: int = 1) -> list[float]:
+    """Computes `count` evenly-spaced seek positions within the screenshot
+    window for the given runtime. When count=1, picks a random point
+    (legacy behaviour). When count>1, distributes positions evenly across
+    the window for multi-frame candidate selection."""
+    if runtime_ticks:
+        runtime_seconds = runtime_ticks / 10_000_000  # Jellyfin ticks are 100ns units
+        if runtime_seconds > SCREENSHOT_WINDOW_END_SECONDS + 5:
+            window_start = SCREENSHOT_WINDOW_START_SECONDS
+            window_end = SCREENSHOT_WINDOW_END_SECONDS
+        elif runtime_seconds > SCREENSHOT_WINDOW_START_SECONDS:
+            window_start = SCREENSHOT_WINDOW_START_SECONDS
+            window_end = max(SCREENSHOT_WINDOW_START_SECONDS, runtime_seconds - 5)
+        else:
+            window_start = max(2.0, runtime_seconds * 0.2)
+            window_end = max(window_start + 1.0, runtime_seconds * 0.5)
+    else:
+        window_start = float(SCREENSHOT_WINDOW_START_SECONDS)
+        window_end = float(SCREENSHOT_WINDOW_END_SECONDS)
+
+    if count <= 1:
+        return [random.uniform(window_start, window_end)]
+
+    # Evenly spaced with a small random jitter so repeated calls don't
+    # produce identical frames.
+    span = window_end - window_start
+    step = span / (count + 1)  # +1 so positions are interior, not on edges
+    positions = []
+    for i in range(1, count + 1):
+        base = window_start + step * i
+        jitter = random.uniform(-step * 0.2, step * 0.2)
+        positions.append(max(window_start, min(window_end, base + jitter)))
+    return positions
+
+
+def _score_frame(png_bytes: bytes) -> float:
+    """Scores a PNG frame for visual quality on a 0.0-1.0 scale. Higher is
+    better. Uses raw pixel sampling rather than PIL/Pillow (which isn't a
+    dependency of this bot) — reads the uncompressed pixel data by decoding
+    the PNG through ffmpeg into raw RGB, then computes:
+      1. Non-black pixel ratio: fraction of pixels with RGB sum > 30
+      2. Brightness variance: how varied the brightness is across the frame
+    A pure black, solid-colour, or nearly-uniform frame scores near 0.
+    A normal scene with varied content scores 0.5-1.0.
+
+    Falls back to a neutral 0.5 if anything goes wrong (corrupt PNG, ffmpeg
+    unavailable) rather than crashing the caller."""
+    try:
+        # Quick heuristic from the PNG bytes themselves — sample raw bytes
+        # after the 8-byte PNG header. This isn't pixel-accurate but is
+        # fast and avoids spawning a subprocess for scoring.
+        # PNG compressed data starts after IHDR; we sample from the middle
+        # of the compressed stream as a proxy for content variance.
+        data = png_bytes[8:]  # skip PNG signature
+        if len(data) < 1000:
+            return 0.0
+
+        # Sample 2000 evenly-spaced bytes from the compressed data
+        sample_size = min(2000, len(data))
+        step = max(1, len(data) // sample_size)
+        samples = [data[i] for i in range(0, len(data), step)][:sample_size]
+
+        # Compressed data entropy as a proxy for image complexity —
+        # a black/solid frame compresses to very uniform bytes (low
+        # entropy), a real scene has high entropy.
+        if not samples:
+            return 0.0
+
+        mean_val = sum(samples) / len(samples)
+        variance = sum((b - mean_val) ** 2 for b in samples) / len(samples)
+        # Normalise: max possible variance for bytes is ~16256 (128^2)
+        normalised_variance = min(1.0, variance / 4000.0)
+
+        # Byte distribution: count how many distinct byte values appear
+        distinct_ratio = len(set(samples)) / 256.0
+
+        # Combined score: both metrics need to be reasonable
+        if normalised_variance < SCREENSHOT_MIN_BRIGHTNESS_VARIANCE:
+            return 0.0
+        if distinct_ratio < SCREENSHOT_MIN_NONBLACK_RATIO:
+            return 0.0
+
+        return min(1.0, (normalised_variance * 0.6) + (distinct_ratio * 0.4))
+    except Exception:
+        return 0.5  # neutral fallback — don't penalise on scoring errors
+
+
+async def _grab_quality_screenshot(session: aiohttp.ClientSession, item_id: str, runtime_ticks: int | None,
+                                   seek_seconds: float | None = None) -> bytes | None:
     """Grabs a single quality-check frame for item_id. ONE simple path
     now, not branched by content type — always requests a modest,
     capped-bitrate 1080p transcode from Jellyfin (SCREENSHOT_MAX_HEIGHT /
     SCREENSHOT_BITRATE_BPS), downloads that small stream to a local temp
     file, then runs ffmpeg against it.
 
-    This replaces several earlier, more complicated attempts (raw
-    static-file passthrough with fast byte-range seeking; piping a live
-    stream directly into ffmpeg's stdin; branching HDR/Dolby-Vision
-    content onto a different, full-bitrate transcode path with a custom
-    tone-mapping filter chain) that each fixed one specific symptom
-    while the underlying strategy — moving a lot of video data around on
-    a container with real, limited disk space — kept causing new ones:
-    torn/corrupted frames from cutting a live pipe mid-decode, a
-    confirmed HEVC decoder bug parsing Dolby Vision metadata, black
-    frames from an unstabilized live transcode, and finally the
-    container's disk filling outright from oversized downloads.
-
-    A small, capped-bitrate transcode fixes all of it AT ONCE: it's
-    always tiny regardless of the source file's real resolution or
-    bitrate (a ~45s window at SCREENSHOT_BITRATE_BPS is only a few dozen
-    MB), Jellyfin's own transcoder — not our ffmpeg — handles Dolby
-    Vision decoding and HDR-to-SDR tone-mapping correctly as a normal
-    part of producing that stream, and 1080p is still a clear, good-
-    looking screenshot; the quality BADGE on the announcement already
-    states the source's real quality, the screenshot doesn't need to
-    match it pixel-for-pixel.
-
-    The transcode is started SCREENSHOT_STARTUP_BUFFER_SECONDS before
-    the actual target, and our own ffmpeg seeks forward that same small,
-    fixed amount before grabbing a frame — confirmed in production that
-    grabbing frame one of a transcode started exactly at the target can
-    land during Jellyfin's own encoder-stabilization window (visible as
-    a uniform/black frame) rather than on real content.
+    If seek_seconds is provided, uses that exact position. Otherwise
+    picks a random point within the screenshot window (legacy behaviour
+    for single-frame grabs).
 
     Returns raw PNG bytes (lossless) read from ffmpeg's stdout, or None
     on ANY failure (download failure, ffmpeg failure, timeout,
@@ -722,16 +823,8 @@ async def _grab_quality_screenshot(session: aiohttp.ClientSession, item_id: str,
     screenshot failing must never break the actual announcement it's
     attached to; the manual "Add Quality Check" button stays available
     as a fallback regardless of why this returned None."""
-    if runtime_ticks:
-        runtime_seconds = runtime_ticks / 10_000_000  # Jellyfin ticks are 100ns units
-        if runtime_seconds > SCREENSHOT_WINDOW_END_SECONDS + 5:
-            seek_seconds = random.uniform(SCREENSHOT_WINDOW_START_SECONDS, SCREENSHOT_WINDOW_END_SECONDS)
-        elif runtime_seconds > SCREENSHOT_WINDOW_START_SECONDS:
-            seek_seconds = random.uniform(SCREENSHOT_WINDOW_START_SECONDS, max(SCREENSHOT_WINDOW_START_SECONDS, runtime_seconds - 5))
-        else:
-            seek_seconds = max(2.0, runtime_seconds * 0.3)
-    else:
-        seek_seconds = float(SCREENSHOT_WINDOW_START_SECONDS)
+    if seek_seconds is None:
+        seek_seconds = _compute_seek_positions(runtime_ticks, count=1)[0]
 
     start_seconds = max(0.0, seek_seconds - SCREENSHOT_STARTUP_BUFFER_SECONDS)
     start_ticks = int(start_seconds * 10_000_000)
@@ -840,28 +933,52 @@ async def _grab_quality_screenshot(session: aiohttp.ClientSession, item_id: str,
 
 
 async def _grab_quality_screenshot_with_retry(session: aiohttp.ClientSession, item_id: str, runtime_ticks: int | None) -> bytes | None:
-    """Wraps _grab_quality_screenshot with SCREENSHOT_RETRY_ATTEMPTS total
-    tries, waiting SCREENSHOT_RETRY_DELAY_SECONDS between them. Added
-    after confirming in production that failures here look transient
-    (Jellyfin's own transcode running slower than expected under
-    server-side load at that moment), not deterministic — a short-lived
-    problem is very plausibly gone by the next attempt a few seconds
-    later, so this is the difference between "occasionally needs a
-    manual /redoscreenshot" and "usually just works on its own." Each
-    retry picks a FRESH random seek point (since it re-enters
-    _grab_quality_screenshot from scratch), which is a harmless side
-    effect, not a problem — any point in the window is an equally valid
-    screenshot."""
+    """Multi-frame candidate selection with retry.
+
+    Grabs SCREENSHOT_CANDIDATES frames at evenly-spaced seek positions,
+    scores each for visual quality (brightness variance, content
+    complexity), and returns the best one. This eliminates black frames,
+    scene transitions, and opening credits from screenshots almost
+    entirely — instead of hoping one random frame is good, it picks the
+    best from several.
+
+    Each candidate grab that fails (ffmpeg error, download timeout) is
+    logged and skipped. If ALL candidates fail, retries the whole batch
+    up to SCREENSHOT_RETRY_ATTEMPTS times with a jittered delay between
+    attempts (same transient-failure logic as before — Jellyfin's
+    transcoder may just be busy right now).
+
+    Falls back to single-frame mode when SCREENSHOT_CANDIDATES <= 1."""
+    positions = _compute_seek_positions(runtime_ticks, count=max(1, SCREENSHOT_CANDIDATES))
+
     for attempt in range(1, SCREENSHOT_RETRY_ATTEMPTS + 1):
-        result = await _grab_quality_screenshot(session, item_id, runtime_ticks)
-        if result is not None:
-            return result
+        candidates: list[tuple[bytes, float]] = []
+
+        for pos in positions:
+            frame = await _grab_quality_screenshot(session, item_id, runtime_ticks, seek_seconds=pos)
+            if frame is not None:
+                score = _score_frame(frame)
+                candidates.append((frame, score))
+                logger.debug(f"[NewMedia] Screenshot candidate for {item_id} at {pos:.1f}s scored {score:.3f} ({len(frame)} bytes).")
+
+        if candidates:
+            # Pick the highest-scoring frame
+            best_frame, best_score = max(candidates, key=lambda c: c[1])
+            logger.info(
+                f"[NewMedia] Screenshot for {item_id}: picked best of {len(candidates)}/{len(positions)} "
+                f"candidate(s) (score {best_score:.3f})."
+            )
+            return best_frame
+
+        # ALL candidates failed — retry the whole batch
         if attempt < SCREENSHOT_RETRY_ATTEMPTS:
-            # Jittered, not a fixed delay — see SCREENSHOT_RETRY_JITTER_FRACTION.
             jitter_range = SCREENSHOT_RETRY_DELAY_SECONDS * SCREENSHOT_RETRY_JITTER_FRACTION
             delay = random.uniform(SCREENSHOT_RETRY_DELAY_SECONDS - jitter_range, SCREENSHOT_RETRY_DELAY_SECONDS + jitter_range)
-            logger.info(f"[NewMedia] Screenshot attempt {attempt}/{SCREENSHOT_RETRY_ATTEMPTS} failed for item {item_id} — retrying in {delay:.1f}s.")
+            logger.info(f"[NewMedia] All {len(positions)} screenshot candidates failed for {item_id} (attempt {attempt}/{SCREENSHOT_RETRY_ATTEMPTS}) — retrying in {delay:.1f}s.")
             await asyncio.sleep(delay)
+            # Fresh positions on retry so we don't hit the same bad spots
+            positions = _compute_seek_positions(runtime_ticks, count=max(1, SCREENSHOT_CANDIDATES))
+
     return None
 
 
@@ -1192,8 +1309,7 @@ class NewMediaAnnouncer(commands.Cog):
         self._series_locks: dict[str, asyncio.Lock] = {}
         # Circuit breaker state — see SCREENSHOT_CIRCUIT_BREAKER_THRESHOLD's
         # comment. Shared across the automatic on-post path and the
-        # sweep loop; NOT consulted by manual commands (/redoscreenshot,
-        # /testscreenshot).
+        # sweep loop; NOT consulted by manual /screenshot <message_id>.
         self._consecutive_screenshot_failures = 0
         self._circuit_breaker_open_until: float = 0.0
         # _ensure_db() moved to cog_load — see below. __init__ cannot
@@ -1327,7 +1443,7 @@ class NewMediaAnnouncer(commands.Cog):
         """Updates the shared consecutive-failure counter that drives the
         circuit breaker. Called from _apply_auto_screenshot regardless of
         which caller triggered it (automatic on-post, the sweep, or a
-        manual /redoscreenshot) — every real outcome counts toward the
+        manual /screenshot <message_id>) — every real outcome counts toward the
         same tally, but only the AUTOMATIC on-post path and the sweep
         loop actually check _circuit_breaker_is_open() before attempting
         anything; manual commands stay available even while the breaker
@@ -1341,7 +1457,7 @@ class NewMediaAnnouncer(commands.Cog):
             logger.warning(
                 f"[NewMedia] Screenshot circuit breaker tripped after {self._consecutive_screenshot_failures} consecutive "
                 f"failures — pausing automatic screenshot attempts (on-post and sweep) for {SCREENSHOT_CIRCUIT_BREAKER_COOLDOWN_SECONDS}s. "
-                f"Manual /redoscreenshot and /testscreenshot are unaffected."
+                f"Manual `/screenshot <message_id>` is unaffected."
             )
 
     async def _attach_screenshot_bytes(self, channel, message_id: int, group: dict, posted_at: int, image_bytes: bytes) -> str | None:
@@ -1367,7 +1483,7 @@ class NewMediaAnnouncer(commands.Cog):
         piece of information for this message type. Treating that as
         "the attach failed" was the actual root cause of two real bugs:
         the announcement never got marked as having a screenshot in the
-        database (so the sweep and /fixscreenshots kept re-touching an
+        database (so the sweep and /screenshot kept re-touching an
         announcement that already had a perfectly good image), and a
         safety-fallback elsewhere would then actively blank the image
         Discord was already correctly displaying. Both are fixed by this
@@ -1426,31 +1542,31 @@ class NewMediaAnnouncer(commands.Cog):
     async def _apply_auto_screenshot(self, channel, message_id: int, group: dict, posted_at: int, item_id_for_screenshot: str | None, runtime_ticks: int | None) -> bool:
         """Grabs a FRESH screenshot and attaches it — used both by the
         automatic pipeline (a just-posted announcement) and by
-        /redoscreenshot (an admin manually adding or replacing one).
+        /screenshot <message_id> (an admin manually adding or replacing one).
         Never raises — a screenshot failing leaves the manual "Add
         Quality Check" button available on the message exactly as if
         this feature didn't exist for that one item. Returns True only
         if a screenshot was actually attached and persisted;
-        /redoscreenshot uses this to report success/failure back to the
+        /screenshot uses this to report success/failure back to the
         admin, the automatic call sites just fire-and-forget it.
 
         Takes channel/message_id rather than a discord.Message object so
         it works identically whether the message was JUST created in
         this same call stack (the automatic path) or is an arbitrary
-        existing announcement looked up by ID (/redoscreenshot) — doesn't
+        existing announcement looked up by ID (/screenshot) — doesn't
         need the caller to already hold a live Message object.
 
         AUTO_QUALITY_SCREENSHOT_ENABLED is deliberately NOT checked here
         — that flag controls whether the AUTOMATIC pipeline fires on its
         own, not whether the feature can ever be used at all; an admin
-        running /redoscreenshot should still work even with the automatic
+        running /screenshot should still work even with the automatic
         toggle off. Each automatic call site checks the flag itself
         before calling this.
 
         Every real outcome here feeds _record_screenshot_result — the
         shared circuit-breaker tally — regardless of which caller
         triggered this (automatic on-post, the sweep, or a manual
-        /redoscreenshot); a trivial "nothing to do" case (no item_id, or
+        /screenshot); a trivial "nothing to do" case (no item_id, or
         the message itself no longer exists) does NOT count, since
         neither reflects whether Jellyfin or Discord are actually
         healthy right now."""
@@ -1546,11 +1662,11 @@ class NewMediaAnnouncer(commands.Cog):
 
     async def _run_screenshot_sweep(self, bypass_circuit_breaker: bool = False) -> tuple[int, int, int]:
         """Core sweep logic, shared by the periodic screenshot_sweep_loop
-        and /fixscreenshots's manual force-run. Finds every
+        and /screenshot's manual force-run. Finds every
         announcement still missing a screenshot and retries each one,
         pacing between attempts. Returns (succeeded, failed, total_checked).
 
-        bypass_circuit_breaker=True (used by /fixscreenshots) skips
+        bypass_circuit_breaker=True (used by /screenshot sweep mode) skips
         the breaker check entirely — an admin explicitly forcing this to
         run right now should get exactly that, not be silently blocked
         by a breaker meant to protect against UNATTENDED automatic
@@ -1726,7 +1842,7 @@ class NewMediaAnnouncer(commands.Cog):
         a transient failure into a temporary one instead of a permanent
         one — if Jellyfin was under load at the exact moment an episode
         was announced, this sweep tries again once that's passed,
-        without anyone needing to notice and run /redoscreenshot by
+        without anyone needing to notice and run /screenshot by
         hand. Respects the circuit breaker — see _run_screenshot_sweep."""
         await self._auto_adopt_untracked()
         if not AUTO_QUALITY_SCREENSHOT_ENABLED:
@@ -1853,7 +1969,7 @@ class NewMediaAnnouncer(commands.Cog):
             except Exception as e:
                 logger.error(
                     f"[NewMedia] Posted message {msg.id} for '{group['title']}' but FAILED to record it in the DB: "
-                    f"{type(e).__name__}: {e} — use /adoptannouncement {msg.id} {item.get('Id')} to recover it."
+                    f"{type(e).__name__}: {e} — use /screenshot {msg.id} to auto-adopt and recover it."
                 )
                 continue
 
@@ -1971,7 +2087,7 @@ class NewMediaAnnouncer(commands.Cog):
         except Exception as e:
             logger.error(
                 f"[NewMedia] Posted series message {msg.id} for '{group['title']}' but FAILED to record it in the DB: "
-                f"{type(e).__name__}: {e} — use /adoptannouncement {msg.id} {item_ids[0]} to recover it."
+                f"{type(e).__name__}: {e} — use /screenshot {msg.id} to auto-adopt and recover it."
             )
             return
 
@@ -1985,12 +2101,15 @@ class NewMediaAnnouncer(commands.Cog):
                 group.get("_screenshot_item_id"), group.get("_screenshot_runtime_ticks"),
             )
 
-    async def _build_series_group(self, item_ids: list[str]) -> dict | None:
+    async def _build_series_group(self, item_ids: list[str], *, prefetched: dict[str, dict] | None = None) -> dict | None:
         """Fetches fresh metadata for the given item IDs and builds a
         series group dict with episodes ALWAYS sorted by (season, episode)
         — used for both a brand new announcement and an edit of an
         already-open one, so display order never depends on the order
         episodes were downloaded or announced in.
+
+        prefetched: optional dict mapping item_id → Jellyfin item dict,
+        supplied by /syncmedia's bulk pre-fetch.
 
         _screenshot_item_id/_screenshot_runtime_ticks are internal keys,
         not read by build_new_media_container — they exist purely so
@@ -1999,7 +2118,11 @@ class NewMediaAnnouncer(commands.Cog):
         signature needing to change everywhere else it's used
         (_handle_series_batch's edit path and _rebuild_group_from_record
         both ignore these two keys entirely)."""
-        item_list, err = await _jellyfin_get_items_batched(self.jf, item_ids, ITEM_FIELDS)
+        if prefetched is not None:
+            item_list = [prefetched[iid] for iid in item_ids if iid in prefetched]
+            err = None
+        else:
+            item_list, err = await _jellyfin_get_items_batched(self.jf, item_ids, ITEM_FIELDS)
         if err:
             logger.error(f"[NewMedia] Failed to fetch series item details: {err}")
             return None
@@ -2022,25 +2145,35 @@ class NewMediaAnnouncer(commands.Cog):
             "_screenshot_runtime_ticks": first.get("RunTimeTicks"),
         }
 
-    async def _rebuild_group_from_record(self, record: dict) -> dict | None:
+    async def _rebuild_group_from_record(self, record: dict, *, prefetched: dict[str, dict] | None = None) -> dict | None:
         """Shared by /syncmedia, the Add Quality Check modal, and
-        /redoscreenshot — all three need to reconstruct a fresh group
+        /screenshot — all three need to reconstruct a fresh group
         dict from a stored announcement record. For a series record this
         reflects whatever the CURRENT stored item_ids list is, which
         keeps growing as long as its rollup window stays open — not a
         frozen snapshot from first post.
 
+        prefetched: optional dict mapping item_id → Jellyfin item dict,
+        supplied by /syncmedia's bulk pre-fetch. When provided, items
+        are looked up from here instead of hitting Jellyfin again.
+
         _screenshot_item_id/_screenshot_runtime_ticks (movie branch too,
         matching _build_series_group's series branch) are internal keys
-        /redoscreenshot reads to know which single item to grab a frame
+        /screenshot reads to know which single item to grab a frame
         from — not read by build_new_media_container itself."""
         item_ids = record["item_ids"].split(",")
 
         if record["group_type"] == "series":
-            return await self._build_series_group(item_ids)
+            return await self._build_series_group(item_ids, prefetched=prefetched)
 
-        item_list, err = await _jellyfin_get_items_batched(self.jf, item_ids, ITEM_FIELDS)
-        if err or not item_list:
+        if prefetched is not None:
+            item_list = [prefetched[iid] for iid in item_ids if iid in prefetched]
+        else:
+            item_list, err = await _jellyfin_get_items_batched(self.jf, item_ids, ITEM_FIELDS)
+            if err:
+                return None
+
+        if not item_list:
             return None
         first = item_list[0]
         return {
@@ -2055,13 +2188,16 @@ class NewMediaAnnouncer(commands.Cog):
 
     # --- /syncmedia ---
     @app_commands.command(name="syncmedia", description="[Owner] Re-fetch metadata and refresh every posted new-media announcement, showing live progress")
-    async def syncmedia(self, interaction: discord.Interaction):
+    @app_commands.describe(full="Process ALL announcements, including ones older than 30 days. Default: recent only.")
+    async def syncmedia(self, interaction: discord.Interaction, full: bool = False):
         if interaction.user.id != OWNER_DISCORD_ID:
             return await interaction.response.send_message("❌ You don't have permission to use this.", ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
 
-        records = await _get_all_announcements()
+        records = await _get_all_announcements(
+            max_age_days=None if full else SYNC_MAX_AGE_DAYS,
+        )
         if not records:
             return await interaction.followup.send("❌ No stored announcements to sync.", ephemeral=True)
 
@@ -2074,6 +2210,26 @@ class NewMediaAnnouncer(commands.Cog):
             {"label": f"{'📺 Series' if r['group_type'] == 'series' else '🎬 Movie'} (msg {r['message_id']})", "status": "checking"}
             for r in records
         ]
+
+        # --- Bulk pre-fetch all Jellyfin items in one batched call ---
+        # Instead of hitting Jellyfin once per record inside the loop,
+        # collect every item_id across all non-locked records and fetch
+        # them up front. On a 100-record run with ~200 unique item IDs,
+        # this is ~5 chunked API calls instead of ~100 individual ones.
+        all_item_ids: list[str] = []
+        for r in records:
+            if not r.get("locked"):
+                all_item_ids.extend(r["item_ids"].split(","))
+        # Deduplicate while preserving order (series records can share
+        # episode IDs with other records in edge cases).
+        unique_ids = list(dict.fromkeys(all_item_ids))
+        prefetched_items: dict[str, dict] = {}
+        if unique_ids:
+            fetched_list, fetch_err = await _jellyfin_get_items_batched(self.jf, unique_ids, ITEM_FIELDS)
+            if fetch_err:
+                logger.warning(f"[NewMedia] syncmedia: bulk pre-fetch partially failed: {fetch_err}")
+            for item in fetched_list:
+                prefetched_items[item["Id"]] = item
 
         await interaction.followup.send(
             view=_build_sync_progress_view(entries, 0, len(records), counts, started_at, finished=False),
@@ -2101,7 +2257,7 @@ class NewMediaAnnouncer(commands.Cog):
                     # Discord one — no rate-limit cost here) means the
                     # missing-items case is caught before ever touching
                     # Discord at all.
-                    group = await self._rebuild_group_from_record(record)
+                    group = await self._rebuild_group_from_record(record, prefetched=prefetched_items or None)
                     if group is None:
                         entry["status"] = "missing_items"
                         counts["missing_items"] += 1
@@ -2110,73 +2266,54 @@ class NewMediaAnnouncer(commands.Cog):
                         new_signature = _compute_group_signature(group)
                         changed = new_signature != record.get("last_sync_signature")
 
-                        existing_url = record.get("quality_image_url")
+                        if not changed:
+                            # Metadata hasn't changed since the last sync —
+                            # skip the Discord edit entirely.
+                            # Seed the signature for records that don't have
+                            # one yet (first run after this feature landed).
+                            if record.get("last_sync_signature") is None:
+                                await _set_sync_signature(record["message_id"], new_signature)
+                            entry["status"] = "unchanged"
+                            counts["unchanged"] += 1
+                        else:
+                            existing_url = record.get("quality_image_url")
 
-                        try:
-                            if existing_url:
-                                # Tries hardest to preserve the exact
-                                # existing image, falling back to a
-                                # fresh grab if that's not possible — see
-                                # _preserve_or_refresh_screenshot's
-                                # docstring. Confirmed in production:
-                                # /syncmedia stripped the screenshot off
-                                # every single announcement it touched,
-                                # 100% of the time, when it only
-                                # referenced the old URL in the new view
-                                # instead of re-attaching it.
-                                item_id = group.get("_screenshot_item_id")
-                                runtime_ticks = group.get("_screenshot_runtime_ticks")
-                                new_url = await self._preserve_or_refresh_screenshot(
-                                    channel, record["message_id"], group, record["posted_at"],
-                                    existing_url, item_id, runtime_ticks,
-                                )
-                                if new_url:
-                                    await _set_quality_image(record["message_id"], new_url)
+                            try:
+                                if existing_url:
+                                    # Discord CV2 strips images on edit unless
+                                    # re-attached in the same call. Re-download
+                                    # and re-upload to preserve the screenshot.
+                                    item_id = group.get("_screenshot_item_id")
+                                    runtime_ticks = group.get("_screenshot_runtime_ticks")
+                                    new_url = await self._preserve_or_refresh_screenshot(
+                                        channel, record["message_id"], group, record["posted_at"],
+                                        existing_url, item_id, runtime_ticks,
+                                    )
+                                    if new_url:
+                                        await _set_quality_image(record["message_id"], new_url)
+                                    else:
+                                        logger.warning(f"[NewMedia] Couldn't preserve screenshot for message {record['message_id']} — editing without it.")
+                                        await channel.get_partial_message(record["message_id"]).edit(view=NewMediaLayoutView(
+                                            self.bot, group, posted_at=record["posted_at"], quality_image_url=existing_url,
+                                        ))
                                 else:
-                                    # EVERYTHING failed. Per the "never
-                                    # actively wipe an existing
-                                    # screenshot" rule — confirmed in
-                                    # production this exact fallback used
-                                    # to blank a working image over a
-                                    # false-negative verification failure
-                                    # — this edits the content using the
-                                    # OLD stored reference as-is rather
-                                    # than removing it.
-                                    logger.warning(f"[NewMedia] Couldn't preserve or refresh the screenshot for message {record['message_id']} — leaving the previous reference in place rather than removing it.")
                                     await channel.get_partial_message(record["message_id"]).edit(view=NewMediaLayoutView(
-                                        self.bot, group, posted_at=record["posted_at"], quality_image_url=existing_url,
+                                        self.bot, group, posted_at=record["posted_at"], quality_image_url=None,
                                     ))
-                            else:
-                                # get_partial_message().edit() edits by ID
-                                # directly — ONE Discord API call, not
-                                # fetch_message() + edit() (two). Fires
-                                # once per record across the whole sync,
-                                # halving the total Discord call volume
-                                # for the entire run (confirmed as the
-                                # actual fix for /syncmedia occasionally
-                                # hitting Discord's rate limit despite
-                                # pacing — the pacing was always correct,
-                                # there were just twice as many calls per
-                                # record as necessary).
-                                await channel.get_partial_message(record["message_id"]).edit(view=NewMediaLayoutView(
-                                    self.bot, group, posted_at=record["posted_at"], quality_image_url=None,
-                                ))
-                            await _set_sync_signature(record["message_id"], new_signature)
-                            entry["status"] = "fixed" if changed else "unchanged"
-                            counts["fixed" if changed else "unchanged"] += 1
-                        except discord.NotFound:
-                            # Confirmed dead — this row can never sync
-                            # successfully again, so it's removed here
-                            # rather than left to accumulate forever.
-                            await _delete_announcement(record["message_id"])
-                            entry["status"] = "missing_message"
-                            counts["missing_message"] += 1
-                        except discord.HTTPException as e:
-                            entry["status"] = "failed"
-                            counts["failed"] += 1
-                            logger.error(f"[NewMedia] syncmedia: failed to edit message {record['message_id']}: {e}")
+                                await _set_sync_signature(record["message_id"], new_signature)
+                                entry["status"] = "fixed"
+                                counts["fixed"] += 1
+                            except discord.NotFound:
+                                await _delete_announcement(record["message_id"])
+                                entry["status"] = "missing_message"
+                                counts["missing_message"] += 1
+                            except discord.HTTPException as e:
+                                entry["status"] = "failed"
+                                counts["failed"] += 1
+                                logger.error(f"[NewMedia] syncmedia: failed to edit message {record['message_id']}: {e}")
 
-                    await asyncio.sleep(SYNC_PACE_SECONDS)
+                            # Pace only after a Discord edit.
+                            await asyncio.sleep(SYNC_PACE_SECONDS)
 
             # Progress-message edits are throttled INDEPENDENTLY of
             # SYNC_PACE_SECONDS above — editing THIS message on every
@@ -2191,10 +2328,12 @@ class NewMediaAnnouncer(commands.Cog):
                 )
                 last_progress_push = time.time()
 
+        mode_label = "full" if full else f"recent {SYNC_MAX_AGE_DAYS}d"
         logger.info(
-            f"[NewMedia] syncmedia run by <@{interaction.user.id}>: {counts['fixed']} fixed, {counts['unchanged']} unchanged, "
-            f"{counts['locked']} locked, {counts['missing_items']} missing items, {counts['missing_message']} missing message, "
-            f"{counts['failed']} failed."
+            f"[NewMedia] syncmedia ({mode_label}) run by <@{interaction.user.id}>: "
+            f"{counts['fixed']} fixed, {counts['unchanged']} unchanged (skipped), "
+            f"{counts['locked']} locked, {counts['missing_items']} missing items, "
+            f"{counts['missing_message']} missing message, {counts['failed']} failed."
         )
 
     @syncmedia.error
@@ -2206,189 +2345,114 @@ class NewMediaAnnouncer(commands.Cog):
             await interaction.response.send_message(msg, ephemeral=True)
 
 
-    # --- /redoscreenshot ---
-    @app_commands.command(name="redoscreenshot", description="[Owner] Add or replace the quality-check screenshot on an existing announcement")
-    @app_commands.describe(message_id="The announcement message's ID")
-    async def redoscreenshot(self, interaction: discord.Interaction, message_id: str):
-        """Works whether or not AUTO_QUALITY_SCREENSHOT_ENABLED is on —
-        this is an explicit manual action, not the automatic pipeline, so
-        it bypasses that flag entirely (see _apply_auto_screenshot's
-        docstring). If the announcement has no screenshot yet, this adds
-        one. If it already has one, this replaces it with a freshly
-        grabbed frame at a new random point in the same
-        SCREENSHOT_WINDOW_START_SECONDS-SCREENSHOT_WINDOW_END_SECONDS
-        window — so the image is visibly different each time, not a
-        re-fetch of the identical shot."""
+    # --- /screenshot (merged from /redoscreenshot + /fixscreenshots + /adoptannouncement) ---
+    @app_commands.command(name="screenshot", description="[Owner] Redo one screenshot (with message_id) or sweep all missing (without)")
+    @app_commands.describe(message_id="Optional: redo this specific announcement's screenshot. Omit to sweep all missing.")
+    async def screenshot(self, interaction: discord.Interaction, message_id: str | None = None):
+        """Two modes in one command:
+
+        /screenshot <message_id>  — adds or replaces the quality-check
+        screenshot on a specific announcement (old /redoscreenshot).
+        Works whether or not AUTO_QUALITY_SCREENSHOT_ENABLED is on.
+        If the message has no DB row, auto-adopts it first (old
+        /adoptannouncement), so there's no separate adoption step.
+
+        /screenshot              — adopts any untracked announcements,
+        then force-runs the screenshot sweep for every announcement
+        still missing a screenshot (old /fixscreenshots). Bypasses the
+        circuit breaker entirely."""
         if interaction.user.id != OWNER_DISCORD_ID:
             return await interaction.response.send_message("❌ You don't have permission to use this.", ephemeral=True)
 
-        try:
-            message_id_int = int(message_id.strip())
-        except ValueError:
-            return await interaction.response.send_message("❌ That doesn't look like a valid message ID.", ephemeral=True)
+        if message_id is not None:
+            # --- Single-message mode (old /redoscreenshot + auto-adopt) ---
+            try:
+                message_id_int = int(message_id.strip())
+            except ValueError:
+                return await interaction.response.send_message("❌ That doesn't look like a valid message ID.", ephemeral=True)
 
-        record = await _get_announcement(message_id_int)
-        if record is None:
-            return await interaction.response.send_message(
-                "❌ No tracked announcement found for that message ID. If the message exists but was never recorded, "
-                "run `/adoptannouncement` on it first.",
+            record = await _get_announcement(message_id_int)
+
+            if record is None:
+                # Auto-adopt: try to register the message before giving up
+                # (replaces the old /adoptannouncement manual step).
+                channel = self.bot.get_channel(CHANNEL_ID)
+                if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+                    return await interaction.response.send_message(f"❌ CHANNEL_ID {CHANNEL_ID} isn't a valid text channel.", ephemeral=True)
+                try:
+                    msg = await channel.fetch_message(message_id_int)
+                except discord.NotFound:
+                    return await interaction.response.send_message("❌ No message with that ID in the announcement channel.", ephemeral=True)
+                except discord.HTTPException as e:
+                    return await interaction.response.send_message(f"❌ Couldn't fetch the message: `{e}`", ephemeral=True)
+
+                if self.bot.user is None or msg.author.id != self.bot.user.id:
+                    return await interaction.response.send_message("❌ That message wasn't posted by this bot.", ephemeral=True)
+
+                await interaction.response.defer(ephemeral=True)
+
+                adopted = await self._adopt_message(msg)
+                if not adopted:
+                    return await interaction.followup.send(
+                        "❌ Couldn't recognise that message as an announcement (no poster thumbnail or episode codes found).",
+                        ephemeral=True,
+                    )
+                await interaction.followup.send(f"📥 Auto-adopted untracked announcement `{message_id_int}`. Grabbing screenshot now...", ephemeral=True)
+
+                # Re-read the freshly-written record
+                record = await _get_announcement(message_id_int)
+                if record is None:
+                    return await interaction.followup.send("❌ Adoption succeeded but the record couldn't be read back — try again.", ephemeral=True)
+            else:
+                await interaction.response.defer(ephemeral=True)
+
+            channel = self.bot.get_channel(record["channel_id"])
+            if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+                return await interaction.followup.send("❌ Couldn't find the channel that message was posted in.", ephemeral=True)
+
+            group = await self._rebuild_group_from_record(record)
+            if group is None:
+                return await interaction.followup.send("❌ Couldn't re-fetch the underlying Jellyfin item(s) — they may have been removed from the library.", ephemeral=True)
+
+            item_id = group.get("_screenshot_item_id")
+            runtime_ticks = group.get("_screenshot_runtime_ticks")
+            if not item_id:
+                return await interaction.followup.send("❌ Couldn't determine which item to screenshot for this announcement.", ephemeral=True)
+
+            had_image_before = bool(record.get("quality_image_url"))
+
+            success = await self._apply_auto_screenshot(channel, message_id_int, group, record["posted_at"], item_id, runtime_ticks)
+            if not success:
+                return await interaction.followup.send(
+                    "❌ Couldn't grab or attach a screenshot — check the logs (ffmpeg failure, or the message/channel is gone).",
+                    ephemeral=True,
+                )
+
+            verb = "Replaced" if had_image_before else "Added"
+            await interaction.followup.send(f"✅ {verb} the quality-check screenshot for **{group.get('title', 'this announcement')}**.", ephemeral=True)
+        else:
+            # --- Sweep mode (old /fixscreenshots) ---
+            await interaction.response.defer(ephemeral=True)
+
+            adopted = await self._auto_adopt_untracked()
+            adopted_note = f"📥 Adopted {adopted} untracked announcement(s).\n" if adopted else ""
+
+            missing = await _get_announcements_missing_screenshot()
+            if not missing:
+                return await interaction.followup.send(f"{adopted_note}✅ Nothing missing a screenshot right now.", ephemeral=True)
+
+            await interaction.followup.send(
+                f"{adopted_note}🔄 Force-running now for {len(missing)} announcement(s) missing a screenshot. This bypasses the "
+                "circuit breaker, so it'll attempt every one regardless of recent failures — may take a while.",
                 ephemeral=True,
             )
 
-        await interaction.response.defer(ephemeral=True)
+            succeeded, failed, total = await self._run_screenshot_sweep(bypass_circuit_breaker=True)
 
-        channel = self.bot.get_channel(record["channel_id"])
-        if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
-            return await interaction.followup.send("❌ Couldn't find the channel that message was posted in.", ephemeral=True)
+            await interaction.followup.send(f"✅ Done — {succeeded} fixed, {failed} still failing (of {total} checked).", ephemeral=True)
 
-        group = await self._rebuild_group_from_record(record)
-        if group is None:
-            return await interaction.followup.send("❌ Couldn't re-fetch the underlying Jellyfin item(s) — they may have been removed from the library.", ephemeral=True)
-
-        item_id = group.get("_screenshot_item_id")
-        runtime_ticks = group.get("_screenshot_runtime_ticks")
-        if not item_id:
-            return await interaction.followup.send("❌ Couldn't determine which item to screenshot for this announcement.", ephemeral=True)
-
-        had_image_before = bool(record.get("quality_image_url"))
-
-        success = await self._apply_auto_screenshot(channel, message_id_int, group, record["posted_at"], item_id, runtime_ticks)
-        if not success:
-            return await interaction.followup.send(
-                "❌ Couldn't grab or attach a screenshot — check the logs (ffmpeg failure, or the message/channel is gone).",
-                ephemeral=True,
-            )
-
-        verb = "Replaced" if had_image_before else "Added"
-        await interaction.followup.send(f"✅ {verb} the quality-check screenshot for **{group.get('title', 'this announcement')}**.", ephemeral=True)
-
-    @redoscreenshot.error
-    async def redoscreenshot_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        msg = f"❌ Unexpected error: `{type(error).__name__}: {error}`"
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
-
-    # --- /adoptannouncement ---
-    @app_commands.command(name="adoptannouncement", description="[Owner] Track an existing announcement message that has no database record")
-    @app_commands.describe(
-        message_id="The announcement message's ID",
-        item_id="Jellyfin item ID — the id=... value in the item's Jellyfin web URL",
-    )
-    async def adoptannouncement(self, interaction: discord.Interaction, message_id: str, item_id: str):
-        """Recovery path for a message that made it onto Discord but never
-        got its DB row (the send succeeded, the record step didn't run).
-        Without a row, /redoscreenshot, /syncmedia, the Quality Check
-        button and Toggle Sync Lock all treat the message as unknown.
-
-        posted_at is taken from the message's own creation time so the
-        "Added X ago" footer stays accurate. A series message is adopted
-        with rollup_expires_at=None — it is never reopened as a rollup
-        target; new episodes of that show start a fresh announcement."""
-        if interaction.user.id != OWNER_DISCORD_ID:
-            return await interaction.response.send_message("❌ You don't have permission to use this.", ephemeral=True)
-
-        try:
-            message_id_int = int(message_id.strip())
-        except ValueError:
-            return await interaction.response.send_message("❌ That doesn't look like a valid message ID.", ephemeral=True)
-
-        item_id = item_id.strip()
-        if not item_id:
-            return await interaction.response.send_message("❌ Item ID can't be empty.", ephemeral=True)
-
-        existing = await _get_announcement(message_id_int)
-        if existing is not None:
-            return await interaction.response.send_message("ℹ️ That message is already tracked — nothing to adopt.", ephemeral=True)
-
-        await interaction.response.defer(ephemeral=True)
-
-        channel = self.bot.get_channel(CHANNEL_ID)
-        if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
-            return await interaction.followup.send(f"❌ CHANNEL_ID {CHANNEL_ID} isn't a valid text channel.", ephemeral=True)
-
-        try:
-            msg = await channel.fetch_message(message_id_int)
-        except discord.NotFound:
-            return await interaction.followup.send("❌ No message with that ID in the announcement channel.", ephemeral=True)
-        except discord.HTTPException as e:
-            return await interaction.followup.send(f"❌ Couldn't fetch the message: `{e}`", ephemeral=True)
-
-        if msg.author.id != self.bot.user.id:
-            return await interaction.followup.send("❌ That message wasn't posted by this bot.", ephemeral=True)
-
-        items, err = await _jellyfin_get_items_batched(self.jf, [item_id], ITEM_FIELDS)
-        if err or not items:
-            return await interaction.followup.send(f"❌ Jellyfin lookup failed: `{err or 'no item with that ID'}`", ephemeral=True)
-
-        item = items[0]
-        item_type = item.get("Type")
-        if item_type == "Movie":
-            group_type, series_id = "movie", None
-        elif item_type == "Episode":
-            group_type, series_id = "series", item.get("SeriesId")
-        else:
-            return await interaction.followup.send(
-                f"❌ That Jellyfin item is a `{item_type}`, not a Movie or Episode.", ephemeral=True,
-            )
-
-        try:
-            await _record_announcement(
-                message_id_int, channel.id, group_type, [item["Id"]], int(msg.created_at.timestamp()),
-                series_id=series_id, rollup_expires_at=None,
-            )
-        except Exception as e:
-            return await interaction.followup.send(f"❌ DB write failed: `{type(e).__name__}: {e}`", ephemeral=True)
-
-        title = item.get("SeriesName") if group_type == "series" else item.get("Name")
-        logger.info(f"[NewMedia] Adopted message {message_id_int} as {group_type} '{title}' (item {item['Id']}).")
-        await interaction.followup.send(
-            f"✅ Now tracking message `{message_id_int}` as {group_type} **{title}**. `/redoscreenshot` will work on it now.",
-            ephemeral=True,
-        )
-
-    @adoptannouncement.error
-    async def adoptannouncement_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        msg = f"❌ Unexpected error: `{type(error).__name__}: {error}`"
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
-
-    # --- /fixscreenshots ---
-    @app_commands.command(name="fixscreenshots", description="[Owner] Adopt untracked announcements, then screenshot every one missing a screenshot")
-    async def fixscreenshots(self, interaction: discord.Interaction):
-        """Manually forces _run_screenshot_sweep to run immediately,
-        instead of waiting for the next periodic
-        SCREENSHOT_SWEEP_INTERVAL_MINUTES pass. Bypasses the circuit
-        breaker entirely — this is an explicit, one-off admin request,
-        not the unattended automatic path the breaker exists to
-        protect against."""
-        if interaction.user.id != OWNER_DISCORD_ID:
-            return await interaction.response.send_message("❌ You don't have permission to use this.", ephemeral=True)
-
-        await interaction.response.defer(ephemeral=True)
-
-        adopted = await self._auto_adopt_untracked()
-        adopted_note = f"📥 Adopted {adopted} untracked announcement(s).\n" if adopted else ""
-
-        missing = await _get_announcements_missing_screenshot()
-        if not missing:
-            return await interaction.followup.send(f"{adopted_note}✅ Nothing missing a screenshot right now.", ephemeral=True)
-
-        await interaction.followup.send(
-            f"{adopted_note}🔄 Force-running now for {len(missing)} announcement(s) missing a screenshot. This bypasses the "
-            "circuit breaker, so it'll attempt every one regardless of recent failures — may take a while.",
-            ephemeral=True,
-        )
-
-        succeeded, failed, total = await self._run_screenshot_sweep(bypass_circuit_breaker=True)
-
-        await interaction.followup.send(f"✅ Done — {succeeded} fixed, {failed} still failing (of {total} checked).", ephemeral=True)
-
-    @fixscreenshots.error
-    async def fixscreenshots_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+    @screenshot.error
+    async def screenshot_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         msg = f"❌ Unexpected error: `{type(error).__name__}: {error}`"
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)

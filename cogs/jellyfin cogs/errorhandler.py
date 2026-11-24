@@ -85,12 +85,61 @@ _JELLYFIN_LOGGER_NAMES = {
     "peak_streams_cog",
     "daily_stats_cog",
     "trending_cog",
-    "newreleases_cog",
+    "new_media_cog",          # was "newreleases_cog" — wrong name
+    "stats_cog",
+    "settings_cog",
+    "jellyfin_api",           # shared API client — logs every 502/503
 }
 
 _bot_ref: commands.Bot | None = None
 _recent_keys: dict[str, float] = {}     # dedup key -> last-sent timestamp
 _suppressed_counts: dict[str, int] = {}  # dedup key -> count suppressed since last send
+
+# --- Self-detected Jellyfin outage suppression ---
+# The uptime cog sets bot.jellyfin_down, but it takes up to ~65s to
+# confirm an outage. During that window, every Jellyfin cog fails
+# independently and spams the error channel. This detects the pattern:
+# if 2+ distinct Jellyfin loggers error within _JF_DETECT_WINDOW_SECONDS,
+# suppress all further Jellyfin errors for _JF_SUPPRESS_SECONDS.
+_JF_DETECT_WINDOW_SECONDS = 30          # look for clustered failures within this window
+_JF_SUPPRESS_SECONDS = 120              # once triggered, suppress for this long
+_JF_ERROR_KEYWORDS = {"502", "503", "bad gateway", "timed out", "timeout", "can't connect", "clientconnectorerror"}
+_jf_recent_errors: dict[str, float] = {}  # logger_name -> timestamp of last Jellyfin-related error
+_jf_suppressed_until: float = 0.0         # unix timestamp — suppress all Jellyfin errors until this time
+_jf_suppressed_count: int = 0             # how many were suppressed in the current window
+
+
+def _is_jellyfin_outage_error(record: logging.LogRecord) -> bool:
+    """Check if this log record looks like a Jellyfin server error (502/503/timeout)."""
+    msg = str(record.getMessage()).lower()
+    return any(kw in msg for kw in _JF_ERROR_KEYWORDS)
+
+
+def _jellyfin_suppressed(record: logging.LogRecord) -> bool:
+    """Returns True if this Jellyfin-cog error should be suppressed.
+    Also updates auto-detection state."""
+    global _jf_suppressed_until, _jf_suppressed_count
+    now = time.time()
+
+    # Already in a suppression window (either from bot.jellyfin_down or auto-detected)
+    if getattr(_bot_ref, "jellyfin_down", False) or now < _jf_suppressed_until:
+        _jf_suppressed_count += 1
+        return True
+
+    # Not in a suppression window — check if this error + recent ones form a cluster
+    if _is_jellyfin_outage_error(record):
+        _jf_recent_errors[record.name] = now
+        # Prune old entries
+        for k in list(_jf_recent_errors):
+            if now - _jf_recent_errors[k] > _JF_DETECT_WINDOW_SECONDS:
+                del _jf_recent_errors[k]
+        # If 2+ distinct Jellyfin loggers errored recently, it's an outage
+        if len(_jf_recent_errors) >= 2:
+            _jf_suppressed_until = now + _JF_SUPPRESS_SECONDS
+            _jf_suppressed_count = 1
+            return True
+
+    return False
 
 _original_view_on_error = discord.ui.View.on_error
 _original_modal_on_error = discord.ui.Modal.on_error
@@ -159,9 +208,11 @@ class ChannelLogHandler(logging.Handler):
                 return
             if record.levelno < logging.WARNING:
                 return
-            # Suppress Jellyfin-related cog errors while the server is
-            # confirmed down — the uptime cog already handles notification.
-            if record.name in _JELLYFIN_LOGGER_NAMES and getattr(_bot_ref, "jellyfin_down", False):
+            # Suppress Jellyfin-related cog errors during outages.
+            # Two layers: (1) bot.jellyfin_down set by the uptime cog, and
+            # (2) auto-detection when 2+ Jellyfin cogs error within 30s
+            # (catches the race window before uptime confirms the outage).
+            if record.name in _JELLYFIN_LOGGER_NAMES and _jellyfin_suppressed(record):
                 return
 
             message = self.format(record)
@@ -182,13 +233,25 @@ class ChannelLogHandler(logging.Handler):
             pass  # the handler itself must never raise — that would break logging bot-wide
 
     async def _report(self, record: logging.LogRecord, message: str, level_label: str, suppressed: int):
+        global _jf_suppressed_count
         color_icon = "🟥" if level_label == "ERROR" or level_label == "CRITICAL" else "🟧"
+
+        # If we just exited a Jellyfin suppression window, append a
+        # one-line note saying how many errors were silenced.
+        footer_extra = ""
+        if _jf_suppressed_count > 0 and not getattr(_bot_ref, "jellyfin_down", False) and time.time() >= _jf_suppressed_until:
+            footer_extra = f" · {_jf_suppressed_count} Jellyfin-outage error(s) suppressed during outage"
+            _jf_suppressed_count = 0
+
         embed = _build_embed(
             title=f"{color_icon} {level_label} — {record.name}",
             description=message,
             fields=None,
             suppressed=suppressed,
         )
+        if footer_extra:
+            existing = embed.footer.text if embed.footer else ""
+            embed.set_footer(text=(existing + footer_extra).strip())
         await _safe_send(embed)
 
 

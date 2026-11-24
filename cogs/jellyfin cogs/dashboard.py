@@ -1110,6 +1110,13 @@ class JellyfinDashboard(commands.Cog):
             watching_role_cog = self.bot.get_cog("JellyfinWatchingRole")
             if watching_role_cog is not None:
                 watching_role_cog.handle_session_event(event_type, data)
+            # Forward to settings cog for instant device detection (account_security)
+            settings_cog = self.bot.get_cog("UserSettings")
+            if settings_cog is not None:
+                try:
+                    await settings_cog.handle_session_event(event_type, data)
+                except Exception as e:
+                    logger.error(f"[JellyfinDashboard] Settings session handler error: {e}", exc_info=True)
         elif event_type in ("library.item.added", "library.item.removed"):
             logger.debug(f"[JellyfinDashboard] {event_type}: itemId={data.get('itemId')} itemType={data.get('itemType')}")
             self._stats_cache = None  # library counts may have changed, force a re-fetch
@@ -1124,6 +1131,14 @@ class JellyfinDashboard(commands.Cog):
                     item_id = data.get("itemId")
                     if item_id:
                         new_media_cog.queue_item(item_id)
+
+            # Forward library events to settings cog for DM notifications
+            settings_cog = self.bot.get_cog("UserSettings")
+            if settings_cog is not None:
+                try:
+                    await settings_cog.handle_library_event(event_type, data)
+                except Exception as e:
+                    logger.error(f"[JellyfinDashboard] Settings library handler error: {e}", exc_info=True)
         # task.* and anything else isn't rendered on this dashboard — ignored.
 
     async def _hydrate_session(self, session_id: str) -> dict | None:
@@ -1147,6 +1162,14 @@ class JellyfinDashboard(commands.Cog):
         watching_role_cog = self.bot.get_cog("JellyfinWatchingRole")
         if watching_role_cog is not None:
             watching_role_cog.handle_playback_event(event_type, data)
+
+        # Forward to settings cog for playback DM notifications
+        settings_cog = self.bot.get_cog("UserSettings")
+        if settings_cog is not None:
+            try:
+                await settings_cog.handle_playback_event(event_type, data)
+            except Exception as e:
+                logger.error(f"[JellyfinDashboard] Settings playback handler error: {e}", exc_info=True)
 
         session_id = data.get("sessionId")
         if not session_id:

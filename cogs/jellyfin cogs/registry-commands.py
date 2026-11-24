@@ -788,7 +788,8 @@ async def _get_all_time_watch_seconds(jellyfin_user_id: str) -> int | None:
     cap = 24 * 3600
     uid = _sql_escape(jellyfin_user_id)
     sql = (
-        "SELECT SUM(PlayDuration) AS total FROM PlaybackActivity "
+        "SELECT SUM(CASE WHEN PlayDuration - COALESCE(PauseDuration, 0) > 0 THEN PlayDuration - COALESCE(PauseDuration, 0) ELSE 0 END) AS total "
+        "FROM PlaybackActivity "
         f"WHERE UserId = '{uid}' AND PlayDuration > 0 AND PlayDuration < {cap}"
     )
     try:
@@ -2025,10 +2026,12 @@ class JellyfinAccountDMView(discord.ui.LayoutView):
         last_activity_ts: int | None = None,
         watch_seconds: int | None = None,
         avatar_url: str | None = None,
+        nav_row: discord.ui.ActionRow | None = None,
     ):
         super().__init__(timeout=None)
         container = discord.ui.Container()
 
+        # -- header with optional avatar --
         header = f"-# YOUR JELLYFIN ACCOUNT\n# {username}"
         if avatar_url:
             container.add_item(discord.ui.Section(
@@ -2039,25 +2042,32 @@ class JellyfinAccountDMView(discord.ui.LayoutView):
             container.add_item(discord.ui.TextDisplay(header))
 
         container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
-        container.add_item(discord.ui.TextDisplay(f"🔑 **Username** — `{username}`\n🎬 **Library Access** — {library_access}"))
-        container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
-        container.add_item(discord.ui.TextDisplay(
-            f"🔗 **Linked to Discord** — {_format_ts(linked_ts)}\n"
-            f"🟢 **Last Login** — {_format_ts(last_login_ts)}\n"
-            f"📺 **Last Active** — {_format_ts(last_activity_ts)}"
-        ))
 
+        # -- all stats merged into one TextDisplay to stay under 10-child limit --
+        stats_lines = [
+            f"🔑 **Username** — `{username}`",
+            f"🎬 **Library Access** — {library_access}",
+            f"🔗 **Linked to Discord** — {_format_ts(linked_ts)}",
+            f"🟢 **Last Login** — {_format_ts(last_login_ts)}",
+            f"📺 **Last Active** — {_format_ts(last_activity_ts)}",
+        ]
         if watch_seconds is not None:
-            container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
-            container.add_item(discord.ui.TextDisplay(f"📊 **Total Watch Time** — {_format_duration(watch_seconds)} all-time"))
+            stats_lines.append(f"📊 **Total Watch Time** — {_format_duration(watch_seconds)} all-time")
+        container.add_item(discord.ui.TextDisplay("\n".join(stats_lines)))
+
+        # -- action buttons inside the container --
+        container.add_item(ResetPasswordActionRow())
+        container.add_item(ChangeUsernameActionRow())
+        container.add_item(DevicesActionRow())
 
         container.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
         container.add_item(discord.ui.TextDisplay(f"-# Service: {JELLYFIN_URL}"))
 
+        # -- nav row at the bottom of the container --
+        if nav_row is not None:
+            container.add_item(nav_row)
+
         self.add_item(container)
-        self.add_item(ResetPasswordActionRow())
-        self.add_item(ChangeUsernameActionRow())
-        self.add_item(DevicesActionRow())
 
 
 # --- /manage PANEL COMPONENTS ---
@@ -3333,6 +3343,52 @@ class JellyfinRegistryCommands(commands.Cog):
         task.add_done_callback(self._background_tasks.discard)
         return task
 
+    async def build_account_page(self, discord_id: int) -> discord.ui.LayoutView | None:
+        """Build the account LayoutView with nav buttons for the /jellyfin DM.
+        Called by settings.py PageNavButton when navigating back to page 0.
+        Returns None if the user has no linked account or the API fails."""
+        link = await _get_link_by_discord_id(discord_id)
+        if link is None:
+            return None
+
+        jellyfin_user_id = link["jellyfin_user_id"]
+        jf_user, watch_seconds = await asyncio.gather(
+            _fetch_jellyfin_user(jellyfin_user_id),
+            _get_all_time_watch_seconds(jellyfin_user_id),
+        )
+        if jf_user is None:
+            return None
+
+        username = jf_user.get("Name", "Unknown")
+        policy = jf_user.get("Policy", {})
+        if policy.get("EnableAllFolders"):
+            library_access = "Full Library"
+        else:
+            folder_count = len(policy.get("EnabledFolders") or [])
+            library_access = f"{folder_count} folder(s)" if folder_count else "None configured"
+
+        avatar_url = f"{JELLYFIN_URL}/Users/{jellyfin_user_id}/Images/Primary" if jf_user.get("PrimaryImageTag") else None
+
+        try:
+            from .settings import build_nav_row
+            nav_row = build_nav_row(discord_id, page=0)
+        except Exception as e:
+            logger.warning(f"[build_account_page] Couldn't build nav row: {e}")
+            nav_row = None
+
+        view = JellyfinAccountDMView(
+            username=username,
+            library_access=library_access,
+            linked_ts=_linked_at_ts(link.get("linked_at")),
+            last_login_ts=_parse_jellyfin_date(jf_user.get("LastLoginDate")),
+            last_activity_ts=_parse_jellyfin_date(jf_user.get("LastActivityDate")),
+            watch_seconds=watch_seconds,
+            avatar_url=avatar_url,
+            nav_row=nav_row,
+        )
+
+        return view
+
     def _loops(self) -> tuple:
         return (self.expire_tokens_loop, self.remind_pending_loop, self.pending_signup_recheck_loop, self.weekly_sync_loop)
 
@@ -3846,7 +3902,7 @@ class JellyfinRegistryCommands(commands.Cog):
     @app_commands.command(name="jellyfin", description="View your Jellyfin account details, and reset your password or change your username")
     async def jellyfin_command(self, interaction: discord.Interaction):
         """DMs the caller a full account summary with Reset Password and
-        Change Username buttons."""
+        Change Username buttons, plus nav to the settings page."""
         link = await _get_link_by_discord_id(interaction.user.id)
         if link is None:
             return await interaction.response.send_message("❌ You don't have a linked Jellyfin account. Ask an admin to link or register one for you.", ephemeral=True)
@@ -3856,34 +3912,10 @@ class JellyfinRegistryCommands(commands.Cog):
         # followups below are marked ephemeral.
         await interaction.response.defer(ephemeral=False)
 
-        jellyfin_user_id = link["jellyfin_user_id"]
-        jf_user, watch_seconds = await asyncio.gather(
-            _fetch_jellyfin_user(jellyfin_user_id),
-            _get_all_time_watch_seconds(jellyfin_user_id),
-        )
-
-        if jf_user is None:
+        dm_view = await self.build_account_page(interaction.user.id)
+        if dm_view is None:
             return await interaction.followup.send("❌ Couldn't find your Jellyfin account — it may have been deleted. Contact an admin.", ephemeral=True)
 
-        username = jf_user.get("Name", "Unknown")
-        policy = jf_user.get("Policy", {})
-        if policy.get("EnableAllFolders"):
-            library_access = "Full Library"
-        else:
-            folder_count = len(policy.get("EnabledFolders") or [])
-            library_access = f"{folder_count} folder(s)" if folder_count else "None configured"
-
-        avatar_url = f"{JELLYFIN_URL}/Users/{jellyfin_user_id}/Images/Primary" if jf_user.get("PrimaryImageTag") else None
-
-        dm_view = JellyfinAccountDMView(
-            username=username,
-            library_access=library_access,
-            linked_ts=_linked_at_ts(link.get("linked_at")),
-            last_login_ts=_parse_jellyfin_date(jf_user.get("LastLoginDate")),
-            last_activity_ts=_parse_jellyfin_date(jf_user.get("LastActivityDate")),
-            watch_seconds=watch_seconds,
-            avatar_url=avatar_url,
-        )
         dm_sent = await _dm_user_view(interaction.client, interaction.user.id, dm_view)
 
         if dm_sent:

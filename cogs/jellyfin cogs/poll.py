@@ -85,6 +85,8 @@ POLL_DURATION_HOURS = 12
 POLL_ANSWER_MAX_CHARS = 55  # Discord's own cap on a single poll answer's text
 CHECK_INTERVAL_SECONDS = 60  # how often the expiry-check loop runs
 
+POLL_PING_ROLE_ID = 1574683570696364121
+
 RESULT_MEDALS = ["🥇", "🥈", "🥉"]
 
 
@@ -340,10 +342,20 @@ class SuggestModal(discord.ui.Modal, title="Suggest something to add"):
         if not ok:
             return await interaction.response.send_message(f"❌ {error}", ephemeral=True)
 
-        await interaction.response.send_message(f"✅ Added **{title} ({year})** as suggestion #{slot}.", ephemeral=True)
-
         fresh_round = await _get_round(self.round_id)
-        await cog.refresh_suggestions_message(fresh_round)
+        suggestions = await _get_suggestions(self.round_id)
+
+        if len(suggestions) >= MAX_SUGGESTIONS:
+            # All 10 slots filled — auto-start the poll immediately.
+            await interaction.response.send_message(
+                f"✅ Added **{title} ({year})** as suggestion #{slot}. All slots filled — starting the poll automatically!",
+                ephemeral=True,
+            )
+            await cog.refresh_suggestions_message(fresh_round)
+            await cog.start_poll(None, fresh_round, suggestions)
+        else:
+            await interaction.response.send_message(f"✅ Added **{title} ({year})** as suggestion #{slot}.", ephemeral=True)
+            await cog.refresh_suggestions_message(fresh_round)
 
 
 # --- PERSISTENT BUTTON ROW ---
@@ -436,16 +448,22 @@ class PollSuggestions(commands.Cog):
         except discord.HTTPException as e:
             logger.error(f"[PollSuggestions] Failed to refresh suggestions message: {type(e).__name__}: {e}")
 
-    async def start_poll(self, interaction: discord.Interaction, round_row: dict, suggestions: list[dict]):
+    async def start_poll(self, interaction: discord.Interaction | None, round_row: dict, suggestions: list[dict]):
         """Sends the actual native poll as a NEW message (Discord doesn't
         allow attaching a poll via edit — see module docstring), then
         edits the original suggestion message to a closed/final state.
         Order matters: post the poll first, so if that fails, the
         suggestion message is left untouched and /poll can just be
-        retried rather than being left in a broken half-closed state."""
+        retried rather than being left in a broken half-closed state.
+
+        ``interaction`` may be *None* when the poll is auto-started
+        after the 10th suggestion — in that case, feedback messages
+        are skipped and the event is logged as an auto-start."""
         channel = self.bot.get_channel(round_row["channel_id"])
         if not isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
-            return await interaction.followup.send("❌ Couldn't find the poll channel.", ephemeral=True)
+            if interaction:
+                return await interaction.followup.send("❌ Couldn't find the poll channel.", ephemeral=True)
+            return
 
         duration = timedelta(hours=POLL_DURATION_HOURS)
         poll = discord.Poll(
@@ -463,7 +481,9 @@ class PollSuggestions(commands.Cog):
             poll_msg = await channel.send(poll=poll)
         except discord.HTTPException as e:
             logger.error(f"[PollSuggestions] Failed to create poll: {type(e).__name__}: {e}")
-            return await interaction.followup.send(f"❌ Failed to create the poll: `{e}`", ephemeral=True)
+            if interaction:
+                return await interaction.followup.send(f"❌ Failed to create the poll: `{e}`", ephemeral=True)
+            return
 
         try:
             old_msg = await channel.fetch_message(round_row["message_id"])
@@ -485,10 +505,14 @@ class PollSuggestions(commands.Cog):
 
         await _set_round_phase(round_row["id"], "polling", poll_message_id=poll_msg.id,
                                 poll_expires_at=expires_at_iso)
-        await interaction.followup.send(
-            f"✅ Poll started with {len(suggestions)} option(s) — runs for {POLL_DURATION_HOURS}h.", ephemeral=True
-        )
-        logger.info(f"[PollSuggestions] Poll started for round {round_row['id']} with {len(suggestions)} option(s) by <@{interaction.user.id}>.")
+
+        if interaction:
+            await interaction.followup.send(
+                f"✅ Poll started with {len(suggestions)} option(s) — runs for {POLL_DURATION_HOURS}h.", ephemeral=True
+            )
+            logger.info(f"[PollSuggestions] Poll started for round {round_row['id']} with {len(suggestions)} option(s) by <@{interaction.user.id}>.")
+        else:
+            logger.info(f"[PollSuggestions] Poll auto-started for round {round_row['id']} — all {len(suggestions)} slots filled.")
 
     async def _finalize_round(self, round_row: dict):
         """Reads final vote counts, deletes the poll message, re-edits the
@@ -626,6 +650,13 @@ class PollSuggestions(commands.Cog):
             await msg.edit(view=real_view)
         except discord.HTTPException as e:
             logger.error(f"[PollSuggestions] Failed to render initial suggestions view: {type(e).__name__}: {e}")
+
+        # Ping the poll role so subscribers know a new round opened
+        try:
+            ping_msg = await channel.send(f"<@&{POLL_PING_ROLE_ID}> New suggestion round is open! Use the button above to submit your picks.")
+            await ping_msg.delete(delay=5)  # auto-delete after 5s — the ping is delivered, no need to keep it
+        except discord.HTTPException:
+            pass  # non-critical
 
         await interaction.followup.send(f"✅ Suggestion round started in {channel.mention}.", ephemeral=True)
         logger.info(f"[PollSuggestions] New suggestion round {round_id} started by <@{interaction.user.id}>.")

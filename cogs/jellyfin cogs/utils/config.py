@@ -44,6 +44,7 @@ POLL_DB_PATH = os.path.join(DB_DIR, "poll.db")
 SCHEDULE_DB_PATH = os.path.join(DB_DIR, "scheduled_posts.db")
 REMOTE_DB_PATH = os.path.join(DB_DIR, "remote.db")
 NEW_MEDIA_DB_PATH = os.path.join(DB_DIR, "new_media.db")
+SETTINGS_DB_PATH = os.path.join(DB_DIR, "settings.db")
 
 # --- Discord embed limits ---
 EMBED_DESCRIPTION_LIMIT = 4096

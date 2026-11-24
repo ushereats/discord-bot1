@@ -341,11 +341,10 @@ class StickyMessage(commands.Cog):
         copy — used by both the debounced on_message trigger and the
         panel's own actions (Set Message, Toggle On, channel change).
 
-        Sends the NEW message before deleting the OLD one, deliberately
-        — if the send fails, the old message (stale but present) is left
-        untouched instead of the channel being left with nothing at all.
-        A delete failure AFTER a successful send just leaves a harmless
-        duplicate that the next repost cleans up on its own.
+        Fires send and delete concurrently so the old message vanishes
+        around the same time the new one appears. Tradeoff: if the send
+        fails the old is already gone, but the channel is only briefly
+        empty and the next repost recovers naturally.
 
         reason is diagnostic-only (logged, nothing else reads it) — pass
         a short label ("leading", "trailing", "panel:toggle_on", etc.) so
@@ -398,14 +397,44 @@ class StickyMessage(commands.Cog):
 
                 old_id = self.config.get("message_id")
 
-                try:
-                    new_msg = await channel.send(**send_kwargs)
-                except discord.HTTPException as e:
-                    logger.error(f"[StickyMessage] Failed to post sticky message — leaving the previous one (if any) in place: {type(e).__name__}: {e} (reason: {reason})")
+                # Fire delete and send concurrently — both API calls
+                # overlap so the old message vanishes around the same
+                # time the new one appears instead of 500ms+ after.
+                # Tradeoff: if the send fails the old is already gone,
+                # but the next repost recovers naturally.
+                async def _delete_old():
+                    if not old_id:
+                        return
+                    try:
+                        await channel.get_partial_message(old_id).delete()
+                    except discord.NotFound:
+                        pass
+                    except discord.HTTPException as e:
+                        logger.warning(
+                            f"[StickyMessage] Failed to delete old sticky ({old_id}): {type(e).__name__}: {e}"
+                        )
+
+                async def _send_new():
+                    return await channel.send(**send_kwargs)
+
+                results = await asyncio.gather(
+                    _send_new(),
+                    _delete_old(),
+                    return_exceptions=True,
+                )
+
+                send_result = results[0]
+                if isinstance(send_result, BaseException):
+                    logger.error(
+                        f"[StickyMessage] Failed to post sticky message: {type(send_result).__name__}: {send_result} "
+                        f"(reason: {reason}) — old message was already deleted, next repost will recover."
+                    )
                     return False
 
+                new_msg = send_result
+
                 # Updated synchronously, immediately — no await between
-                # this line and send() returning. This closes HALF the
+                # this line and the gather returning. This closes HALF the
                 # race (our own code seeing the update in time); the
                 # OTHER half — the gateway delivering MESSAGE_CREATE for
                 # this exact message before send()'s REST response even
@@ -422,22 +451,6 @@ class StickyMessage(commands.Cog):
                     f"[StickyMessage] Reposted — reason={reason}, channel={channel_id}, old_message={old_id}, "
                     f"new_message={new_msg.id}, process_id={os.getpid()}."
                 )
-
-                if old_id:
-                    try:
-                        # get_partial_message deletes by ID directly —
-                        # one API call instead of fetch_message() +
-                        # delete(). Fires on every single repost, so this
-                        # halves the delete-side network cost across the
-                        # cog's entire hot path.
-                        await channel.get_partial_message(old_id).delete()
-                    except discord.NotFound:
-                        pass
-                    except discord.HTTPException as e:
-                        logger.warning(
-                            f"[StickyMessage] New sticky posted, but failed to delete the old one ({old_id}) — "
-                            f"it'll sit as a harmless duplicate until the next repost: {type(e).__name__}: {e}"
-                        )
 
                 await _persist_to_db(message_id=new_msg.id)
                 return True
