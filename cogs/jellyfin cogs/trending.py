@@ -196,7 +196,7 @@ class TrendingData:
             "AND ItemName IS NOT NULL AND ItemName != ''"
         )
         rows = await self._sql(
-            f"SELECT ItemId, ItemName, SUM(CASE WHEN PlayDuration - COALESCE(PauseDuration, 0) > 0 THEN PlayDuration - COALESCE(PauseDuration, 0) ELSE 0 END) AS secs FROM PlaybackActivity "
+            f"SELECT ItemId, ItemName, SUM(PlayDuration) AS secs FROM PlaybackActivity "
             f"WHERE {where} GROUP BY ItemId, ItemName"
         )
         if rows is None:
@@ -258,7 +258,7 @@ class TrendingData:
         if not ids:
             return
         rows = await self._sql(
-            f"SELECT UserId, ItemId, SUM(CASE WHEN PlayDuration - COALESCE(PauseDuration, 0) > 0 THEN PlayDuration - COALESCE(PauseDuration, 0) ELSE 0 END) AS secs FROM PlaybackActivity WHERE {where} "
+            f"SELECT UserId, ItemId, SUM(PlayDuration) AS secs FROM PlaybackActivity WHERE {where} "
             f"AND ItemId IN ({', '.join(_sql_str(i) for i in ids)}) GROUP BY UserId, ItemId"
         )
         if rows is None:

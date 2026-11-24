@@ -788,7 +788,7 @@ async def _get_all_time_watch_seconds(jellyfin_user_id: str) -> int | None:
     cap = 24 * 3600
     uid = _sql_escape(jellyfin_user_id)
     sql = (
-        "SELECT SUM(CASE WHEN PlayDuration - COALESCE(PauseDuration, 0) > 0 THEN PlayDuration - COALESCE(PauseDuration, 0) ELSE 0 END) AS total "
+        "SELECT SUM(PlayDuration) AS total "
         "FROM PlaybackActivity "
         f"WHERE UserId = '{uid}' AND PlayDuration > 0 AND PlayDuration < {cap}"
     )

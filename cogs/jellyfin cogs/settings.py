@@ -985,7 +985,7 @@ class UserSettings(commands.Cog):
             sql = (
                 "SELECT "
                 "  COUNT(*) as total_items, "
-                "  SUM(CASE WHEN PlayDuration - COALESCE(PauseDuration, 0) > 0 THEN PlayDuration - COALESCE(PauseDuration, 0) ELSE 0 END) as total_seconds, "
+                "  SUM(PlayDuration) as total_seconds, "
                 "  SUM(CASE WHEN ItemType = 'Movie' THEN 1 ELSE 0 END) as movies, "
                 "  SUM(CASE WHEN ItemType = 'Episode' THEN 1 ELSE 0 END) as episodes "
                 "FROM PlaybackActivity "

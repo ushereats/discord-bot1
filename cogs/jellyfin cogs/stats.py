@@ -178,9 +178,9 @@ async def _get_watch_totals(jellyfin_user_id: str) -> dict:
 
     sql = (
         "SELECT "
-        f"SUM(CASE WHEN DateCreated >= '{week_cutoff}' THEN CASE WHEN PlayDuration - COALESCE(PauseDuration, 0) > 0 THEN PlayDuration - COALESCE(PauseDuration, 0) ELSE 0 END ELSE 0 END) AS week_seconds, "
-        f"SUM(CASE WHEN DateCreated >= '{month_cutoff}' THEN CASE WHEN PlayDuration - COALESCE(PauseDuration, 0) > 0 THEN PlayDuration - COALESCE(PauseDuration, 0) ELSE 0 END ELSE 0 END) AS month_seconds, "
-        "SUM(CASE WHEN PlayDuration - COALESCE(PauseDuration, 0) > 0 THEN PlayDuration - COALESCE(PauseDuration, 0) ELSE 0 END) AS all_time_seconds "
+        f"SUM(CASE WHEN DateCreated >= '{week_cutoff}' THEN PlayDuration ELSE 0 END) AS week_seconds, "
+        f"SUM(CASE WHEN DateCreated >= '{month_cutoff}' THEN PlayDuration ELSE 0 END) AS month_seconds, "
+        "SUM(PlayDuration) AS all_time_seconds "
         f"FROM PlaybackActivity WHERE UserId = '{uid}' "
         f"AND PlayDuration > 0 AND PlayDuration < {cap}"
     )
@@ -207,7 +207,7 @@ async def _get_most_watched(jellyfin_user_id: str) -> tuple[str | None, int]:
     sql = (
         "SELECT CASE WHEN ItemType='Episode' AND ItemName LIKE '% - s%' "
         "THEN SUBSTR(ItemName, 1, INSTR(ItemName, ' - s') - 1) ELSE ItemName END AS display_name, "
-        "SUM(CASE WHEN PlayDuration - COALESCE(PauseDuration, 0) > 0 THEN PlayDuration - COALESCE(PauseDuration, 0) ELSE 0 END) AS total "
+        "SUM(PlayDuration) AS total "
         f"FROM PlaybackActivity WHERE UserId = '{uid}' "
         f"AND PlayDuration > 0 AND PlayDuration < {cap} "
         "GROUP BY display_name ORDER BY total DESC LIMIT 1"
@@ -227,7 +227,7 @@ async def _get_per_item_totals(jellyfin_user_id: str) -> list[dict]:
     uid = _sql_escape(jellyfin_user_id)
     cap = MAX_PLAUSIBLE_PLAY_DURATION_SECONDS
     sql = (
-        "SELECT ItemId, SUM(CASE WHEN PlayDuration - COALESCE(PauseDuration, 0) > 0 THEN PlayDuration - COALESCE(PauseDuration, 0) ELSE 0 END) AS total "
+        "SELECT ItemId, SUM(PlayDuration) AS total "
         f"FROM PlaybackActivity WHERE UserId = '{uid}' AND ItemId IS NOT NULL AND ItemId != '' "
         f"AND PlayDuration > 0 AND PlayDuration < {cap} "
         "GROUP BY ItemId"
